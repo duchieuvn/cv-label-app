@@ -1,0 +1,13 @@
+# Python packages for LabelApp's optional features. The app itself runs on Node and needs none of them.
+# Install into a conda env:  conda activate ml && pip install -r requirements.txt
+# Tested with Python 3.12, ultralytics 8.4, torch 2.12, paramiko 5.1 and pillow 13.
+
+# Auto labeling (server/autobox_worker.py): trains YOLOv8 detection and pose models and predicts with them.
+# Installs PyTorch as a dependency. For a GPU, install the CUDA build of torch first; see README.md.
+ultralytics>=8.1
+
+# Reads and resizes images, for both auto labeling and remote training.
+pillow>=10.0
+
+# Remote training (scripts/remote_train.py): SSH and file transfer to the GPU server.
+paramiko>=3.0
