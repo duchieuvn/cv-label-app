@@ -7,7 +7,9 @@ const dataDir = resolve(process.env.DATA_DIR ?? 'data');
 
 const importRoots = (process.env.IMPORT_ROOTS ?? '').split(delimiter).filter(Boolean);
 
-const { app } = createApp(dataDir, { host, importRoots, python: process.env.LABELAPP_PYTHON });
+// LABELAPP_REMOTE_COMMAND replaces the one-click remote script, which the browser tests use to avoid SSH.
+const remoteCommand = process.env.LABELAPP_REMOTE_COMMAND?.split(' ').filter(Boolean);
+const { app } = createApp(dataDir, { host, importRoots, python: process.env.LABELAPP_PYTHON, remoteCommand });
 app.listen(port, host, () => {
   console.log(`LabelApp listening on http://${host}:${port} (data: ${dataDir})`);
 });

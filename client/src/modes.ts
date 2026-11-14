@@ -9,8 +9,14 @@ export type ModeConfig = {
   showBoxes: boolean;
   /** Labels can define keypoints and skeletons. */
   keypoints: boolean;
-  /** The auto bounding box panel is offered. */
+  /** The auto labeling panel is offered. */
   autoBox: boolean;
+  /** The panel's name, which is also its accessible region name. */
+  autoName: string;
+  /** What the model draws, singular and plural. */
+  autoUnit: [string, string];
+  /** The YOLOv8 model family it trains, as written in weight names: `yolov8n.pt` or `yolov8n-pose.pt`. */
+  modelSuffix: '' | '-pose';
   cocoFormat: string;
   yoloFormat: string;
   emptyHint: string;
@@ -26,6 +32,9 @@ export const MODES: Record<ProjectMode, ModeConfig> = {
     showBoxes: true,
     keypoints: false,
     autoBox: true,
+    autoName: 'Auto bounding box',
+    autoUnit: ['box', 'boxes'],
+    modelSuffix: '',
     cocoFormat: 'COCO detection JSON',
     yoloFormat: 'YOLO detection (zip)',
     emptyHint: 'Nothing annotated yet. Draw a box.',
@@ -41,7 +50,10 @@ export const MODES: Record<ProjectMode, ModeConfig> = {
     defaultTool: 'keypoint',
     showBoxes: false,
     keypoints: true,
-    autoBox: false,
+    autoBox: true,
+    autoName: 'Auto keypoints',
+    autoUnit: ['keypoint', 'keypoints'],
+    modelSuffix: '-pose',
     cocoFormat: 'COCO keypoints JSON',
     yoloFormat: 'YOLO pose (zip)',
     emptyHint: 'Nothing annotated yet. Place a keypoint.',

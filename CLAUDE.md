@@ -33,9 +33,15 @@ activating is not enough by itself: check that `which python3` points into `envs
   from here, which keeps zod out of the browser bundle.
 - `server/app.ts`: Express routes. `server/store.ts`: SQLite through `node:sqlite`, with migrations in
   the `MIGRATIONS` array (append only; `user_version` tracks them). `server/export.ts`: pure exporters. `server/import.ts`: pure COCO and native JSON import (parse, match images by path, plan writes).
+  `server/bundle.ts`: pure project files for sharing a project (build, parse and check, plan opening); the route
+  creates the project with images `missing` and the folder scan matches the files.
   `server/scan.ts`: background folder scans, with status held in memory. `server/imageInfo.ts`: identifies
   an image from its contents, for both uploads and scans. `server/autobox.ts`: the auto box job, with status held
   in memory, which runs `server/autobox_worker.py` and reads its progress as JSON lines on file descriptor 3.
+  `server/remote.ts`: pure planning of a remote training bundle and conversion of its results. `server/remoteJob.ts`:
+  the one-click remote run, which runs `scripts/remote_train.py` as a child process (needs `paramiko` in `ml`) and
+  reads its progress on file descriptor 3; the worker runs on the other machine with `--standalone`. Tests replace
+  the script with `tests/fake_remote_train.ts`.
 - `client/src/annotate/`: the annotator.
   - `geometry.ts` and `doc.ts` are pure and unit tested. Put new annotation logic here, not in components.
   - `Canvas.tsx` owns zoom, pan, and pointer interaction. A drag is previewed locally through `applyDrag`
@@ -65,7 +71,10 @@ activating is not enough by itself: check that `which python3` points into `envs
 - Serve scanned files with the type detected from their contents, since a scanned file can have any name.
   Never accept a file path from a request: files are reached by image id only.
 - Auto boxes are guesses. An image with `autoBoxed` must never be trained on or exported as if a person drew its
-  boxes, and a job must never overwrite an image a person has edited. See `specs.md` section 10.
+  boxes, and a job must never overwrite an image a person has edited. See `specs.md` section 10. Keypoint projects
+  train pose models and get keypoints without boxes.
+- A `.pt` model file is only ever accepted with the results of a bundle this app issued (`POST .../remote/results`).
+  Never add another way to load one, since loading it runs code.
 - Image labels never affect which images COCO and YOLO export; they have their own `image_labels` format.
 - An image with `fileState` other than `ok` has read-only annotations, enforced by the server, because its
   stored dimensions may not match the file. Labels and status can still change.
@@ -82,5 +91,7 @@ Pure logic gets unit tests in `tests/unit`, HTTP behavior goes in `tests/unit/ap
 server and temp directory, and interaction goes in `tests/e2e`. Pointer behavior can only be trusted from
 the e2e tests, so run them after touching `Canvas.tsx` or `AnnotatePage.tsx`.
 
-Automated tests replace the auto box worker with `tests/fake_autobox_worker.ts`, so they need no Python and
-do not exercise `server/autobox_worker.py`. After changing the worker, run a real job on a small project.
+Automated tests replace the auto box worker with `tests/fake_autobox_worker.ts` and the remote script with
+`tests/fake_remote_train.ts`, so they need no Python or SSH and do not exercise `server/autobox_worker.py` or
+`scripts/remote_train.py`. After changing the worker, run a real job on a small project; after changing the script,
+run a real remote run. The password for a remote run must never reach a log, a status, or an argument.

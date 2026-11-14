@@ -14,7 +14,12 @@ export default defineConfig({
       command: 'npm run build && npm start',
       url: 'http://127.0.0.1:3101/api/projects',
       // The browser tests cover the auto box UI, not training, which the worker's own run covers.
-      env: { PORT: '3101', DATA_DIR: dataDir, LABELAPP_PYTHON: resolve('tests/fake_autobox_worker.ts') },
+      env: {
+        PORT: '3101',
+        DATA_DIR: dataDir,
+        LABELAPP_PYTHON: resolve('tests/fake_autobox_worker.ts'),
+        LABELAPP_REMOTE_COMMAND: `${process.execPath} ${resolve('tests/fake_remote_train.ts')}`,
+      },
       reuseExistingServer: false,
     },
     {

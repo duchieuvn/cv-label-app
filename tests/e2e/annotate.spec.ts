@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { basename, join } from 'node:path';
 import { expect, test, type APIRequestContext, type Page } from '@playwright/test';
 import type { Annotation, ImageDetail, ImageMeta, Label, Project, ProjectMode } from '../../shared/schema.ts';
-import { makePng, withExifOrientation } from '../helpers.ts';
+import { makePng, unzip, withExifOrientation } from '../helpers.ts';
 
 const CAR: Label = { id: 'car', name: 'car', color: '#3ddc97', keypoints: [], skeleton: [] };
 const TRUCK: Label = { id: 'truck', name: 'truck', color: '#4d96ff', keypoints: [], skeleton: [] };
@@ -225,7 +225,11 @@ test('a keypoint project shows only what is about keypoints', async ({ page, req
   await expect(page.getByTestId('project-mode')).toHaveText('Keypoints');
   await expect(page.getByRole('tab', { name: /^All/ })).toBeVisible();
   await expect(page.getByRole('region', { name: 'Auto bounding box' })).toHaveCount(0);
-  await expect(page.getByRole('tab', { name: /^Auto/ })).toHaveCount(0);
+  const auto = page.getByRole('region', { name: 'Auto keypoints' });
+  await expect(auto).toBeVisible();
+  await expect(auto).toContainText('draws keypoints');
+  await expect(auto).toContainText('Training needs at least 10 images with saved keypoints.');
+  await expect(page.getByRole('tab', { name: /^Auto/ })).toBeVisible();
   await expect(page.getByLabel('Format').locator('option')).toContainText(['COCO keypoints JSON', 'YOLO pose (zip)']);
 });
 
@@ -559,8 +563,8 @@ test('auto boxing marks predictions for review, and they can be accepted or remo
   await expect(page.getByTestId('autobox-model')).toHaveText('No trained model yet.');
   // The base weights are all there is to train from, and their patience cannot be changed.
   await expect(panel.getByLabel('Train from')).toHaveValue('yolov8n.pt');
-  await expect(panel.getByLabel('Patience')).toBeDisabled();
-  await expect(panel.getByLabel('Patience')).toHaveValue('20');
+  await expect(panel.getByLabel('Patience', { exact: true })).toBeDisabled();
+  await expect(panel.getByLabel('Patience', { exact: true })).toHaveValue('20');
   await expect(panel).toContainText('Fixed at 20 for yolov8n.pt.');
 
   for (const id of ids.slice(1, 10)) await request.put(`/api/images/${id}/annotations`, { data: { annotations: [box(`a${id}`)] } });
@@ -575,7 +579,7 @@ test('auto boxing marks predictions for review, and they can be accepted or remo
   // The new checkpoint is selected for both, and its patience can be chosen.
   await expect(panel.getByLabel('Train from')).not.toHaveValue('yolov8n.pt');
   await expect(panel.getByLabel('Draw with').locator('option')).toHaveCount(1);
-  await expect(panel.getByLabel('Patience')).toBeEnabled();
+  await expect(panel.getByLabel('Patience', { exact: true })).toBeEnabled();
 
   // A checkpoint can draw again, without training, at the confidence the slider shows.
   await panel.getByLabel('Confidence').fill('0.4');
@@ -585,13 +589,13 @@ test('auto boxing marks predictions for review, and they can be accepted or remo
   await expect(page.getByTestId('autobox-status')).toContainText('at confidence 0.40');
 
   // An impossible patience cannot be started.
-  await panel.getByLabel('Patience').fill('');
+  await panel.getByLabel('Patience', { exact: true }).fill('');
   await expect(start).toBeDisabled();
-  await panel.getByLabel('Patience').fill('301');
+  await panel.getByLabel('Patience', { exact: true }).fill('301');
   await expect(start).toBeDisabled();
 
   // Training from a checkpoint uses the chosen patience, and adds another checkpoint.
-  await panel.getByLabel('Patience').fill('7');
+  await panel.getByLabel('Patience', { exact: true }).fill('7');
   await start.click();
   await expect(page.getByTestId('autobox-status')).toContainText('Continued the checkpoint from');
   await expect(panel.getByLabel('Draw with').locator('option')).toHaveCount(2);
@@ -599,8 +603,8 @@ test('auto boxing marks predictions for review, and they can be accepted or remo
 
   // Choosing the base weights puts the patience back to the fixed value, whatever was typed.
   await panel.getByLabel('Train from').selectOption('yolov8n.pt');
-  await expect(panel.getByLabel('Patience')).toBeDisabled();
-  await expect(panel.getByLabel('Patience')).toHaveValue('20');
+  await expect(panel.getByLabel('Patience', { exact: true })).toBeDisabled();
+  await expect(panel.getByLabel('Patience', { exact: true })).toHaveValue('20');
   await start.click();
   await expect(page.getByTestId('autobox-status')).toContainText('Trained on');
   await expect(panel.getByLabel('Draw with').locator('option')).toHaveCount(3);
@@ -654,6 +658,58 @@ test('auto boxing marks predictions for review, and they can be accepted or remo
   await expect(page.getByTestId('autobox-model')).toHaveText('No trained model yet.');
   await expect(panel.getByRole('button', { name: 'Draw with trained model' })).toBeDisabled();
   await expect(panel.getByRole('button', { name: 'Delete checkpoint' })).toHaveCount(0);
+});
+
+test('a remote run\'s results come back as predictions and a checkpoint', async ({ page, request }) => {
+  const { project, ids } = await setup(request, 12, 100, 50);
+  const box = (id: string): Annotation => ({ id, labelId: 'car', bbox: { x: 10, y: 10, w: 20, h: 20 }, keypoints: {} });
+  for (const id of ids.slice(0, 10)) await request.put(`/api/images/${id}/annotations`, { data: { annotations: [box(`a${id}`)] } });
+  await page.goto(`/#/projects/${project.id}`);
+  const panel = page.getByRole('region', { name: 'Auto bounding box' });
+  await panel.getByText('Train on a remote server').click();
+  await panel.getByLabel('Remote model').selectOption('l');
+
+  // One click does the whole round trip, and the password is gone from the page afterwards.
+  const trainRemote = panel.getByRole('button', { name: 'Train on server and draw' });
+  await expect(trainRemote).toBeDisabled();
+  await panel.getByLabel('Server').fill('me@gpu.example');
+  await panel.getByLabel('Password').fill('secret');
+  await trainRemote.click();
+  await expect(page.getByTestId('remote-status')).toContainText(/Finished training on me@gpu.example. Trained on \d+ images, 3 epochs, best mAP50 0.80. Drawing on 2 images here with the new checkpoint./);
+  await expect(panel.getByLabel('Password')).toHaveValue('');
+  // The server only trained; the drawing is the ordinary local job with the new checkpoint.
+  await expect(page.getByTestId('autobox-status')).toContainText('Drew 2 boxes on 2 images');
+  await expect(page.getByRole('tab', { name: 'Auto (2)' })).toBeVisible();
+  await expect(panel.getByLabel('Draw with')).toContainText('yolov8l, remote');
+  await expect(panel.getByLabel('Draw with').locator('option')).toHaveCount(1);
+  await request.delete(`/api/projects/${project.id}/autobox/predictions`);
+
+  // The manual steps are the same run by hand. The bundle link carries the chosen options, and the app remembers the bundle it made.
+  await panel.getByText('Manual steps').click();
+  const link = panel.getByRole('link', { name: 'Download bundle' });
+  await expect(link).toHaveAttribute('href', /model=l/);
+  const bundle = await request.get((await link.getAttribute('href'))!);
+  expect(bundle.ok()).toBe(true);
+  expect(bundle.headers()['content-disposition']).toContain('.zip');
+  const entries = unzip(await bundle.body());
+  expect(Object.keys(entries).filter((e) => e.startsWith('images/'))).toHaveLength(10);
+  const bundleId = JSON.parse(entries['job.json']).bundleId as string;
+
+  const results = {
+    bundleId,
+    task: 'detect',
+    trainedAt: '2026-11-12T09:00:00.000Z',
+    trainImages: 8,
+    epochs: 25,
+    bestMap50: 0.88,
+    predictions: [],
+    skipped: [],
+  };
+  await panel.getByTestId('remote-results').setInputFiles({ name: 'results.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(results)) });
+  await panel.getByTestId('remote-weights').setInputFiles({ name: 'best.pt', mimeType: 'application/octet-stream', buffer: Buffer.from('weights') });
+  await panel.getByRole('button', { name: 'Import results' }).click();
+  await expect(page.getByTestId('remote-summary')).toContainText('Trained on 8 images, 25 epochs, best mAP50 0.88. The trained model was added as a checkpoint: use Draw with trained model.');
+  await expect(panel.getByLabel('Draw with').locator('option')).toHaveCount(2);
 });
 
 test('the image list renders only visible rows and follows navigation',async ({ page, request }) => {

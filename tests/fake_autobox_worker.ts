@@ -30,11 +30,14 @@ if (job.train) {
   send({ type: 'trained', epoch: 2, stoppedEarly: true, bestMap50: 0.75, weights });
 }
 
+// A pose job gets two keypoints per box: one confident, one below the threshold, so only the first is placed.
+const keypoints = (x: number, y: number) => (job.task === 'pose' ? { keypoints: [[x + 2, y + 2, 0.9], [x + 3, y + 3, 0.1]] } : {});
+
 if (mode === 'hang') {
-  send({ type: 'pred', id: job.targets[0].id, boxes: [{ cls: 0, x: 1, y: 1, w: 5, h: 5 }] });
+  send({ type: 'pred', id: job.targets[0].id, boxes: [{ cls: 0, x: 1, y: 1, w: 5, h: 5, ...keypoints(1, 1) }] });
   setInterval(() => {}, 1000);
 } else {
   for (const target of job.targets) {
-    send({ type: 'pred', id: target.id, boxes: [{ cls: 0, x: 1, y: 1, w: target.width / 2, h: target.height / 2 }] });
+    send({ type: 'pred', id: target.id, boxes: [{ cls: 0, x: 1, y: 1, w: target.width / 2, h: target.height / 2, ...keypoints(1, 1) }] });
   }
 }

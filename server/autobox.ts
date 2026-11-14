@@ -20,7 +20,10 @@ import {
   type AutoBoxCheckpoint,
   type AutoBoxModel,
   type AutoBoxStatus,
+  type AutoBoxTask,
   type Label,
+  type PlacedKeypoint,
+  type ProjectMode,
 } from "../shared/schema.ts";
 import { nextLabelColor } from "../shared/colors.ts";
 import { effectiveBBox } from "./export.ts";
@@ -32,12 +35,19 @@ const MIN_VALIDATION_FRACTION = 0.1;
 const MAX_LISTED_ERRORS = 100;
 const STDERR_TAIL = 2000;
 export const TRAINING = {
-  weights: "yolov8n.pt",
   imgsz: 640,
   maxEpochs: 300,
   patience: 20,
   confidence: 0.65,
+  /** A predicted keypoint scoring below this is left unplaced. */
+  keypointConfidence: 0.5,
 };
+
+/** What a project's mode trains: boxes, or boxes with keypoints. */
+export const taskOf = (mode: ProjectMode): AutoBoxTask => (mode === "keypoint" ? "pose" : "detect");
+
+/** The base weights for a task and YOLOv8 size letter, such as yolov8m-pose.pt. */
+export const baseWeights = (task: AutoBoxTask, size = "n") => `yolov8${size}${task === "pose" ? "-pose" : ""}.pt`;
 
 export type YoloBox = {
   cls: number;
@@ -45,6 +55,8 @@ export type YoloBox = {
   cy: number;
   w: number;
   h: number;
+  /** Pose only: `x y v` per keypoint slot, normalized, padded with zeros to the task's keypoint count. */
+  keypoints?: number[];
 };
 export type PredictedBox = {
   cls: number;
@@ -52,11 +64,19 @@ export type PredictedBox = {
   y: number;
   w: number;
   h: number;
+  /** Pose only: `[x, y, confidence]` per keypoint slot, in image pixels. */
+  keypoints?: [number, number, number][];
 };
+/** A model class: the label it stands for and, for pose models, the label's keypoint ids per slot. */
+export type ModelClass = { id: string; name?: string; keypointIds?: string[] };
+
+/** The keypoint slots per class: YOLO needs one count for the whole dataset, so shorter labels are padded. */
+export const keypointCount = (labels: Label[]) => Math.max(0, ...labels.map((l) => l.keypoints.length));
 type Size = { width: number; height: number };
 type JobImages = { training: AutoBoxImage[]; targets: AutoBoxImage[] };
 type JobOptions = {
   mode: "train" | "predict";
+  task: AutoBoxTask;
   confidence: number;
   patience: number;
   /** The checkpoint to start training from or draw with. Null means the base weights. */
@@ -135,6 +155,18 @@ export function labelsForClasses(
   return added;
 }
 
+/** An instance's normalized box in YOLO form, or null if its label is not a class or nothing of it is inside. */
+function normalizedBox(a: Annotation, labels: Label[], size: Size): YoloBox | null {
+  const clamp = (value: number) => Math.min(1, Math.max(0, value));
+  const cls = labels.findIndex((l) => l.id === a.labelId);
+  const box = effectiveBBox(a, size);
+  const left = clamp(box.x / size.width);
+  const top = clamp(box.y / size.height);
+  const w = clamp((box.x + box.w) / size.width) - left;
+  const h = clamp((box.y + box.h) / size.height) - top;
+  return cls >= 0 && w > 0 && h > 0 ? { cls, cx: left + w / 2, cy: top + h / 2, w, h } : null;
+}
+
 /**
  * One training line per object. A keypoint-only instance gets the same box as in exports, because
  * leaving it out would teach the model that a real object is background.
@@ -144,17 +176,35 @@ export function toYoloBoxes(
   labels: Label[],
   size: Size,
 ): YoloBox[] {
+  return annotations.flatMap((a) => {
+    const box = normalizedBox(a, labels, size);
+    return box ? [box] : [];
+  });
+}
+
+/**
+ * Pose training lines: each box followed by `x y v` per keypoint slot in the label's order, padded with
+ * zeros to `slots`, as the YOLO exporter does. An unplaced keypoint is `0 0 0`.
+ */
+export function toYoloPose(
+  annotations: Annotation[],
+  labels: Label[],
+  size: Size,
+  slots: number,
+): YoloBox[] {
   const clamp = (value: number) => Math.min(1, Math.max(0, value));
   return annotations.flatMap((a) => {
-    const cls = labels.findIndex((l) => l.id === a.labelId);
-    const box = effectiveBBox(a, size);
-    const left = clamp(box.x / size.width);
-    const top = clamp(box.y / size.height);
-    const w = clamp((box.x + box.w) / size.width) - left;
-    const h = clamp((box.y + box.h) / size.height) - top;
-    return cls >= 0 && w > 0 && h > 0
-      ? [{ cls, cx: left + w / 2, cy: top + h / 2, w, h }]
-      : [];
+    const box = normalizedBox(a, labels, size);
+    if (!box) return [];
+    const label = labels[box.cls];
+    const keypoints: number[] = [];
+    for (let k = 0; k < slots; k++) {
+      const definition = label.keypoints[k];
+      const p = definition && a.keypoints[definition.id];
+      if (p) keypoints.push(clamp(p.x / size.width), clamp(p.y / size.height), p.v);
+      else keypoints.push(0, 0, 0);
+    }
+    return [{ ...box, keypoints }];
   });
 }
 
@@ -164,20 +214,38 @@ export function toYoloBoxes(
  */
 export function toPredictedAnnotations(
   boxes: PredictedBox[],
-  classes: { id: string }[],
+  classes: ModelClass[],
   currentLabels: Label[],
   size: Size,
+  task: AutoBoxTask = "detect",
 ): Annotation[] {
   const round = (value: number) => Math.round(value * 100) / 100;
   const annotations = boxes.flatMap((box): Annotation[] => {
-    const labelId = classes[box.cls]?.id;
-    if (!labelId || !currentLabels.some((l) => l.id === labelId)) return [];
+    const cls = classes[box.cls];
+    const label = cls && currentLabels.find((l) => l.id === cls.id);
+    if (!label) return [];
     const x = Math.max(0, round(box.x));
     const y = Math.max(0, round(box.y));
     const w = round(Math.min(box.x + box.w, size.width) - x);
     const h = round(Math.min(box.y + box.h, size.height) - y);
-    return w > 0 && h > 0
-      ? [{ id: randomUUID(), labelId, bbox: { x, y, w, h }, keypoints: {} }]
+    if (task === "detect") {
+      return w > 0 && h > 0
+        ? [{ id: randomUUID(), labelId: label.id, bbox: { x, y, w, h }, keypoints: {} }]
+        : [];
+    }
+    // A keypoint project stores keypoints only (specs.md section 11). Slots map to the ids saved at
+    // training time, and a keypoint deleted since then has nowhere to go.
+    const keypoints: Record<string, PlacedKeypoint> = {};
+    (box.keypoints ?? []).forEach(([kx, ky, confidence], slot) => {
+      const keypointId = cls.keypointIds?.[slot];
+      if (!keypointId || confidence < TRAINING.keypointConfidence) return;
+      if (!label.keypoints.some((k) => k.id === keypointId)) return;
+      const px = round(Math.min(size.width, Math.max(0, kx)));
+      const py = round(Math.min(size.height, Math.max(0, ky)));
+      keypoints[keypointId] = { x: px, y: py, v: 2 };
+    });
+    return Object.keys(keypoints).length > 0
+      ? [{ id: randomUUID(), labelId: label.id, bbox: null, keypoints }]
       : [];
   });
   const error = findAnnotationError(annotations, currentLabels, size);
@@ -186,7 +254,7 @@ export function toPredictedAnnotations(
 }
 
 type Job = { status: AutoBoxStatus; cancelled: boolean; stop: () => void };
-export type CheckpointOwner = { id: string; name: string; labels: Label[] };
+export type CheckpointOwner = { id: string; name: string; labels: Label[]; mode: ProjectMode };
 type Options = {
   dataDir: string;
   command: string[];
@@ -240,6 +308,8 @@ export class AutoBoxManager {
         try {
           const model: AutoBoxModel = JSON.parse(readFileSync(join(folder, name), "utf8"));
           const classNames = model.classNames ?? model.classIds.map((id) => owner.labels.find((l) => l.id === id)?.name ?? "");
+          // A detector is useless in a keypoint project and the other way round, so each project sees its task only.
+          if ((model.task ?? "detect") !== taskOf(owner.mode)) return [];
           return [{ ...model, file, classNames }];
         } catch {
           return [];
@@ -248,7 +318,7 @@ export class AutoBoxManager {
       .sort((a, b) => b.trainedAt.localeCompare(a.trainedAt));
   }
 
-  /** The project's saved checkpoints, newest first. They outlive the job and a restart. */
+  /** The project's saved checkpoints of its task, newest first. They outlive the job and a restart. */
   checkpoints(project: CheckpointOwner): AutoBoxCheckpoint[] {
     return this.readModels(project).map(({ file, ...model }) => ({
       ...model,
@@ -266,7 +336,7 @@ export class AutoBoxManager {
    */
   otherCheckpoints(project: CheckpointOwner, others: CheckpointOwner[]): AutoBoxCheckpoint[] {
     return others
-      .filter((owner) => owner.id !== project.id)
+      .filter((owner) => owner.id !== project.id && owner.mode === project.mode)
       .flatMap((owner) =>
         this.readModels(owner).map(({ file, ...model }) => ({
           ...model,
@@ -278,6 +348,11 @@ export class AutoBoxManager {
         })),
       )
       .sort((a, b) => b.trainedAt.localeCompare(a.trainedAt));
+  }
+
+  /** The weights file of a checkpoint from the project's lists, wherever its owner keeps it. */
+  weightsPath(checkpoint: AutoBoxCheckpoint): string {
+    return this.checkpointFile(checkpoint.projectId, checkpoint.id.slice(checkpoint.id.lastIndexOf("/") + 1), ".pt");
   }
 
   removeCheckpoint(projectId: string, id: string) {
@@ -292,12 +367,15 @@ export class AutoBoxManager {
     });
   }
 
-  /** Adds a checkpoint, renaming into place so a failure never leaves half of one. */
-  private saveCheckpoint(
+  /**
+   * Adds a checkpoint, renaming into place so a failure never leaves half of one. Besides the local job,
+   * this takes the weights a remote run trained, which the results import has already tied to a bundle.
+   */
+  importCheckpoint(
     projectId: string,
     weights: string,
     model: AutoBoxModel,
-  ) {
+  ): string {
     mkdirSync(join(this.modelsDir, "projects", projectId), { recursive: true });
     const id = randomUUID();
     const saved = this.checkpointFile(projectId, id, ".pt");
@@ -306,6 +384,7 @@ export class AutoBoxManager {
     renameSync(`${saved}.tmp`, saved);
     writeFileSync(`${details}.tmp`, JSON.stringify(model));
     renameSync(`${details}.tmp`, details);
+    return id;
   }
 
   get(projectId: string): AutoBoxStatus | null {
@@ -364,13 +443,18 @@ export class AutoBoxManager {
     };
     this.jobs.set(projectId, job);
     const workDir = join(this.workRoot, randomUUID());
+    console.log(`[autobox ${projectId.slice(0, 8)}] ${options.mode} (${options.task}): ${images.training.length} training, ${images.targets.length} targets`);
     void this.run(job, projectId, labels, images, options, workDir)
       .catch((error) => {
         job.status.state = "failed";
         job.status.error =
           error instanceof Error ? error.message : String(error);
       })
-      .finally(() => rm(workDir, { recursive: true, force: true }));
+      .finally(() => {
+        const { status } = job;
+        console.log(`[autobox ${projectId.slice(0, 8)}] ${status.state}: ${status.boxes} annotations on ${status.boxedImages} images${status.error ? `, error: ${status.error}` : ""}`);
+        return rm(workDir, { recursive: true, force: true });
+      });
     return job.status;
   }
 
@@ -386,21 +470,21 @@ export class AutoBoxManager {
     const training = options.mode === "train" ? images.training : [];
     const validation = chooseValidation(training.map((i) => i.id));
     const { checkpoint } = options;
-    // Another project's handle is "<owner>/<file>", and the file lives under the owner.
-    const modelPath =
-      checkpoint &&
-      this.checkpointFile(checkpoint.projectId, checkpoint.id.slice(checkpoint.id.lastIndexOf("/") + 1), ".pt");
+    const modelPath = checkpoint && this.weightsPath(checkpoint);
     const trainingClasses = chooseTrainingStart(checkpoint, labels).classes;
+    const slots = options.task === "pose" ? keypointCount(trainingClasses) : 0;
     // A checkpoint's class numbers mean the labels it was trained on, whatever the project has now.
-    const classes =
+    const classes: ModelClass[] =
       options.mode === "train"
-        ? trainingClasses
+        ? trainingClasses.map((l) => ({ id: l.id, name: l.name, keypointIds: l.keypoints.map((k) => k.id) }))
         : checkpoint
-          ? resolveClasses(checkpoint, labels).map((l) => ({ id: l?.id ?? "" }))
+          ? resolveClasses(checkpoint, labels).map((l, i) => ({ id: l?.id ?? "", keypointIds: checkpoint.keypointIds?.[i] ?? [] }))
           : [];
     const manifest = {
       ...TRAINING,
-      weights: job.status.continued ? modelPath : TRAINING.weights,
+      task: options.task,
+      kptShape: options.task === "pose" ? [slots, 3] : null,
+      weights: job.status.continued ? modelPath : baseWeights(options.task),
       confidence: options.confidence,
       patience: options.patience,
       train: options.mode === "train",
@@ -412,7 +496,10 @@ export class AutoBoxManager {
         width: image.width,
         height: image.height,
         split: validation.has(image.id) ? "val" : "train",
-        boxes: toYoloBoxes(image.annotations, trainingClasses, image),
+        boxes:
+          options.task === "pose"
+            ? toYoloPose(image.annotations, trainingClasses, image, slots)
+            : toYoloBoxes(image.annotations, trainingClasses, image),
       })),
       targets: images.targets.map((image) => ({
         id: image.id,
@@ -457,7 +544,7 @@ export class AutoBoxManager {
       (line) => {
         if (job.cancelled) return;
         try {
-          this.handle(job, projectId, classes, sizes, JSON.parse(line));
+          this.handle(job, projectId, options.task, classes, sizes, JSON.parse(line));
         } catch (error) {
           job.status.error =
             error instanceof Error ? error.message : String(error);
@@ -489,7 +576,8 @@ export class AutoBoxManager {
   private handle(
     job: Job,
     projectId: string,
-    classes: { id: string; name?: string }[],
+    task: AutoBoxTask,
+    classes: ModelClass[],
     sizes: Map<string, Size>,
     message: Record<string, any>,
   ) {
@@ -509,13 +597,17 @@ export class AutoBoxManager {
         status.epoch = message.epoch;
         status.stoppedEarly = message.stoppedEarly;
         status.bestMap50 = message.bestMap50;
-        this.saveCheckpoint(projectId, message.weights, {
+        this.importCheckpoint(projectId, message.weights, {
           trainedAt: new Date().toISOString(),
           trainImages: status.trainImages,
           epochs: message.epoch,
           bestMap50: message.bestMap50,
           classIds: classes.map((c) => c.id),
           classNames: classes.map((c) => c.name ?? ""),
+          task,
+          keypointIds: classes.map((c) => c.keypointIds ?? []),
+          modelSize: "n",
+          source: "local",
         });
         break;
       case "pred": {
@@ -528,6 +620,7 @@ export class AutoBoxManager {
           classes,
           labels,
           size,
+          task,
         );
         if (
           this.store.saveAutoBoxes(message.id, annotations) &&

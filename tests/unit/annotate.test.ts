@@ -212,7 +212,7 @@ describe('MODES', () => {
 
   it('keeps each mode to its own tools and features', () => {
     expect(MODES.bbox).toMatchObject({ tools: ['select', 'bbox'], showBoxes: true, keypoints: false, autoBox: true });
-    expect(MODES.keypoint).toMatchObject({ tools: ['select', 'keypoint'], showBoxes: false, keypoints: true, autoBox: false });
+    expect(MODES.keypoint).toMatchObject({ tools: ['select', 'keypoint'], showBoxes: false, keypoints: true, autoBox: true, autoName: 'Auto keypoints' });
     expect(JSON.stringify(MODES.bbox.shortcuts).toLowerCase()).not.toContain('keypoint');
     expect(JSON.stringify(MODES.keypoint.shortcuts).toLowerCase()).not.toContain('box');
   });

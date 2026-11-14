@@ -4,10 +4,10 @@ import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Annotation, AutoBoxInfo, AutoBoxStatus, ImageDetail, ImageMeta, Label, Project, UploadResult } from '../../shared/schema.ts';
+import type { Annotation, AutoBoxInfo, AutoBoxStatus, ImageDetail, ImageMeta, Label, Project, RemoteJobStatus, UploadResult } from '../../shared/schema.ts';
 import { createApp } from '../../server/app.ts';
 import { AutoBoxManager, chooseTrainingStart, chooseValidation, toPredictedAnnotations, toYoloBoxes, TRAINING, type YoloBox } from '../../server/autobox.ts';
-import { makePng } from '../helpers.ts';
+import { makePng, unzip } from '../helpers.ts';
 
 const car: Label = { id: 'car', name: 'car', color: '#00ff00', keypoints: [], skeleton: [] };
 const person: Label = { id: 'person', name: 'person', color: '#ff0000', keypoints: [], skeleton: [] };
@@ -143,7 +143,11 @@ describe('auto box API', () => {
   beforeAll(async () => {
     dataDir = mkdtempSync(join(tmpdir(), 'labelapp-autobox-'));
     process.env.FAKE_AUTOBOX_COPY = join(dataDir, 'job-copy.json');
-    const created = createApp(dataDir, { autoBoxCommand: [process.execPath, resolve(import.meta.dirname, '../fake_autobox_worker.ts')] });
+    process.env.FAKE_REMOTE_PASSWORD_FILE = join(dataDir, 'password-seen.txt');
+    const created = createApp(dataDir, {
+      autoBoxCommand: [process.execPath, resolve(import.meta.dirname, '../fake_autobox_worker.ts')],
+      remoteCommand: [process.execPath, resolve(import.meta.dirname, '../fake_remote_train.ts')],
+    });
     store = created.store;
     await new Promise<void>((done) => {
       server = created.app.listen(0, '127.0.0.1', () => done());
@@ -169,6 +173,7 @@ describe('auto box API', () => {
 
   afterEach(() => {
     delete process.env.FAKE_AUTOBOX;
+    delete process.env.FAKE_REMOTE;
   });
 
   it('requires enough images with boxes, and something to draw on', async () => {
@@ -244,11 +249,29 @@ describe('auto box API', () => {
     expect((await get(images[11].id)).annotations).toEqual([box('human')]);
   });
 
-  it('is only available in bounding box projects', async () => {
+  it('trains a pose model in a keypoint project and places only confident keypoints, without boxes', async () => {
     const other: Project = await (await send('/projects', 'POST', { name: 'points', mode: 'keypoint', labels: [posed] })).json();
-    const response = await send(`/projects/${other.id}/autobox`, 'POST', {});
-    expect(response.status).toBe(422);
-    expect((await response.json()).error).toContain('bounding box projects');
+    const form = new FormData();
+    for (let i = 0; i < 12; i++) form.append('files', new Blob([new Uint8Array(makePng(100, 50))]), `${i}.png`);
+    const uploaded = ((await (await fetch(`${base}/projects/${other.id}/images`, { method: 'POST', body: form })).json()) as UploadResult).uploaded;
+    for (const image of uploaded.slice(0, 10)) {
+      await send(`/images/${image.id}/annotations`, 'PUT', { annotations: [{ id: 'k', labelId: 'person', bbox: null, keypoints: { head: { x: 5, y: 5, v: 2 } } }] });
+    }
+    const otherInfo = async (): Promise<AutoBoxInfo> => (await send(`/projects/${other.id}/autobox`, 'GET')).json();
+    expect(await otherInfo()).toMatchObject({ trainable: 10, targets: 2, baseCheckpoint: 'yolov8n-pose.pt', defaultCheckpoint: 'yolov8n-pose.pt' });
+    expect((await send(`/projects/${other.id}/autobox`, 'POST', { checkpoint: 'yolov8n.pt' })).status).toBe(422);
+    expect((await send(`/projects/${other.id}/autobox`, 'POST', { checkpoint: 'yolov8n-pose.pt' })).status).toBe(202);
+    await vi.waitFor(async () => expect((await otherInfo()).job?.state).toBe('done'));
+
+    const job = jobFile();
+    expect(job).toMatchObject({ task: 'pose', kptShape: [2, 3], weights: 'yolov8n-pose.pt' });
+    expect(job.training[0].boxes[0].keypoints).toEqual([0.05, 0.1, 2, 0, 0, 0]);
+    const drawn = await get(uploaded[11].id);
+    expect(drawn).toMatchObject({ autoBoxed: true, status: 'todo' });
+    expect(drawn.annotations[0]).toMatchObject({ labelId: 'person', bbox: null, keypoints: { head: { x: 3, y: 3, v: 2 } } });
+    expect((await otherInfo()).checkpoints[0]).toMatchObject({ task: 'pose', keypointIds: [['head', 'foot']], modelSize: 'n', source: 'local' });
+    // A detector trained elsewhere is not offered to a keypoint project.
+    expect((await otherInfo()).otherCheckpoints).toEqual([]);
   });
 
   it('does not overwrite an image edited after the job started', async () => {
@@ -291,6 +314,191 @@ describe('auto box API', () => {
     expect((await send(`/projects/${project.id}/autobox`, 'DELETE')).status).toBe(204);
     expect(await finished()).toMatchObject({ state: 'cancelled', boxedImages: 1 });
     expect((await send(`/projects/${project.id}/autobox`, 'DELETE')).status).toBe(409);
+  });
+
+  describe('remote training', () => {
+    const weightsOf = (id: string) => join(dataDir, 'models', 'projects', project.id, `${id}.pt`);
+    const checkpoints = async () => (await info()).checkpoints;
+    const train = async (body?: object) => {
+      expect((await start(body)).status).toBe(202);
+      return finished();
+    };
+    const bundleResponse = (query = '') => fetch(`${base}/projects/${project.id}/remote/bundle?${query}`);
+    const bundleOf = async (query = '', projectId = project.id) => {
+      const response = await fetch(`${base}/projects/${projectId}/remote/bundle?${query}`);
+      expect(response.status).toBe(200);
+      const entries = unzip(Buffer.from(await response.arrayBuffer()));
+      return { entries, job: JSON.parse(entries['job.json']) };
+    };
+    const postResults = async (results: object, weights: string | null = 'fake weights') => {
+      const form = new FormData();
+      form.append('results', new Blob([JSON.stringify(results)], { type: 'application/json' }), 'results.json');
+      if (weights !== null) form.append('weights', new Blob([weights]), 'best.pt');
+      return fetch(`${base}/projects/${project.id}/remote/results`, { method: 'POST', body: form });
+    };
+    it('streams a bundle with the job, the worker and only the labelled images', async () => {
+      const response = await bundleResponse('model=s&epochs=7&patience=3');
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-disposition')).toContain('_remote_');
+      const entries = unzip(Buffer.from(await response.arrayBuffer()));
+      const names = Object.keys(entries);
+      expect(names).toContain('job.json');
+      expect(entries['worker.py']).toContain('--standalone');
+      expect(names.filter((e) => e.startsWith('images/'))).toHaveLength(10);
+      expect(names).not.toContain('start.pt');
+      expect(entries['images/t0000000.png'].slice(1, 4)).toBe('PNG');
+      const job = JSON.parse(entries['job.json']);
+      expect(job).toMatchObject({ task: 'detect', weights: 'yolov8s.pt', maxEpochs: 7, patience: 3, classes: ['car', 'person'], train: true });
+      expect(job.training[0]).toMatchObject({ path: 'images/t0000000.png', width: 100, height: 50, boxes: [{ cls: 0 }] });
+      expect(job.targets).toEqual([]);
+    });
+
+    it('refuses a bundle without enough annotated images, and a bad option', async () => {
+      expect((await bundleResponse('imgsz=100')).status).toBe(400);
+      for (const image of images.slice(0, 5)) await annotate(image.id, []);
+      expect((await bundleResponse()).status).toBe(422);
+    });
+
+    it('includes the checkpoint to continue from, and keeps its model size', async () => {
+      await train();
+      const [first] = await checkpoints();
+      const { entries, job } = await bundleOf(`model=x&checkpoint=${first.id}`);
+      expect(entries['start.pt']).toBe('fake model');
+      expect(job.weights).toBe('start.pt');
+    });
+
+    it('imports the weights as a remote checkpoint, and any predictions as unreviewed', async () => {
+      const bundleId = (await bundleOf('model=m')).job.bundleId;
+      // A person edits one target meanwhile, which the import must not touch.
+      await annotate(images[10].id, [box('human')]);
+
+      const results = {
+        bundleId,
+        task: 'detect',
+        trainedAt: '2026-11-12T10:00:00.000Z',
+        trainImages: 8,
+        epochs: 40,
+        bestMap50: 0.91,
+        stoppedEarly: true,
+        predictions: [
+          { id: images[10].id, boxes: [{ cls: 0, x: 1, y: 1, w: 5, h: 5 }] },
+          { id: images[11].id, boxes: [{ cls: 1, x: 2, y: 2, w: 6, h: 6 }, { cls: 7, x: 0, y: 0, w: 1, h: 1 }] },
+        ],
+        skipped: [{ path: 'images/p0000003.png', reason: 'unreadable' }],
+      };
+      const imported = await postResults(results);
+      expect(imported.status).toBe(200);
+      expect(await imported.json()).toMatchObject({ bundleId, task: 'detect', predicted: 2, boxedImages: 1, annotations: 1, dropped: 1, checkpointAdded: true, checkpointId: expect.any(String), skipped: results.skipped });
+      expect((await get(images[10].id)).annotations[0].id).toBe('human');
+      const drawn = await get(images[11].id);
+      expect(drawn).toMatchObject({ autoBoxed: true, status: 'todo', annotationCount: 1 });
+      expect(drawn.annotations[0]).toMatchObject({ labelId: 'person', bbox: { x: 2, y: 2, w: 6, h: 6 } });
+
+      const [checkpoint] = await checkpoints();
+      expect(checkpoint).toMatchObject({ trainedAt: results.trainedAt, epochs: 40, bestMap50: 0.91, classIds: ['car', 'person'], task: 'detect', modelSize: 'm', source: 'remote', canContinue: true });
+      expect(readFileSync(weightsOf(checkpoint.id), 'utf8')).toBe('fake weights');
+      // The imported model can draw, with its own class numbers.
+      await annotate(images[11].id, []);
+      expect((await start({ mode: 'predict', checkpoint: checkpoint.id })).status).toBe(202);
+      expect(await finished()).toMatchObject({ state: 'done', checkpointTrainedAt: results.trainedAt });
+    });
+
+    it('refuses results that are not from this project\'s bundle, and never takes weights without them', async () => {
+      const results = { bundleId: 'nope', task: 'detect', trainedAt: 't', trainImages: 1, epochs: 1, bestMap50: null, predictions: [] };
+      expect((await postResults(results)).status).toBe(422);
+      expect(await checkpoints()).toEqual([]);
+
+      const other: Project = await (await send('/projects', 'POST', { name: 'other', labels: [car] })).json();
+      const form = new FormData();
+      for (let i = 0; i < 11; i++) form.append('files', new Blob([new Uint8Array(makePng(100, 50))]), `${i}.png`);
+      const uploaded = ((await (await fetch(`${base}/projects/${other.id}/images`, { method: 'POST', body: form })).json()) as UploadResult).uploaded;
+      for (const image of uploaded.slice(0, 10)) await annotate(image.id, [box()]);
+      const foreign = (await bundleOf('', other.id)).job.bundleId;
+      expect((await postResults({ ...results, bundleId: foreign })).status).toBe(422);
+
+      const bundleId = (await bundleOf()).job.bundleId;
+      expect((await postResults({ ...results, bundleId, task: 'pose' })).status).toBe(422);
+      expect((await postResults({ ...results, bundleId, predictions: 'x' })).status).toBe(400);
+      const noWeights = await postResults({ ...results, bundleId }, null);
+      expect(noWeights.status).toBe(200);
+      expect(await noWeights.json()).toMatchObject({ checkpointAdded: false });
+      expect(await checkpoints()).toEqual([]);
+      expect(readdirSync(join(dataDir, 'tmp')).filter((f) => !f.startsWith('autobox'))).toHaveLength(0);
+    });
+  });
+
+  describe('one-click remote run', () => {
+    const remoteInfo = async (): Promise<RemoteJobStatus | null> => (await send(`/projects/${project.id}/remote`, 'GET')).json();
+    const startRemote = (body: object) => send(`/projects/${project.id}/remote`, 'POST', { target: 'me@gpu.example', password: 'hunter2', ...body });
+    const remoteFinished = async (): Promise<RemoteJobStatus> => {
+      let job: RemoteJobStatus | null = null;
+      await vi.waitFor(async () => {
+        job = await remoteInfo();
+        expect(job?.state).not.toBe('running');
+      });
+      return job!;
+    };
+
+    it('bundles, trains through the script with the password on stdin, keeps the checkpoint, and draws here with it', async () => {
+      expect(await remoteInfo()).toBeNull();
+      const response = await startRemote({ model: 'l', epochs: 5 });
+      expect(response.status).toBe(202);
+      const started = await response.json();
+      expect(started).toMatchObject({ state: 'running', phase: 'bundling', target: 'me@gpu.example', modelSize: 'l' });
+      expect(JSON.stringify(started)).not.toContain('hunter2');
+
+      const job = await remoteFinished();
+      expect(JSON.stringify(job)).not.toContain('hunter2');
+      expect(job).toMatchObject({ state: 'done', phase: 'drawing', gpu: 'Fake GPU, 24576 MiB', epoch: 3, bestMap50: 0.8, uploaded: 1000, uploadTotal: 1000, error: null, checkpointId: expect.any(String) });
+      expect(job.drawing).toContain('Drawing on 2 images here');
+      // The hash-based split holds out at least one of the ten annotated images, and how many depends on their ids.
+      expect(job.trainImages).toBeGreaterThanOrEqual(1);
+      expect(job.trainImages).toBeLessThanOrEqual(9);
+      expect(job.summary).toMatchObject({ task: 'detect', predicted: 0, annotations: 0, checkpointAdded: true, checkpointId: job.checkpointId });
+      expect(readFileSync(process.env.FAKE_REMOTE_PASSWORD_FILE!, 'utf8')).toBe('hunter2');
+      const { checkpoints } = await info();
+      expect(checkpoints[0]).toMatchObject({ id: job.checkpointId, modelSize: 'l', source: 'remote', epochs: 3, classIds: ['car', 'person'] });
+      expect(readFileSync(join(dataDir, 'models', 'projects', project.id, `${checkpoints[0].id}.pt`), 'utf8')).toBe('remote weights');
+      expect(readdirSync(join(dataDir, 'tmp', 'remote'))).toEqual([]);
+
+      // The local job it started draws with the new checkpoint, through the ordinary worker.
+      expect(await finished()).toMatchObject({ state: 'done', mode: 'predict', checkpointTrainedAt: checkpoints[0].trainedAt, boxedImages: 2 });
+      expect(await get(images[11].id)).toMatchObject({ autoBoxed: true, status: 'todo', annotationCount: 1 });
+    });
+
+    it('says so when there is nothing to draw on after training', async () => {
+      for (const image of images.slice(10)) await send(`/images/${image.id}/annotations`, 'PUT', { status: 'done' });
+      expect((await startRemote({})).status).toBe(202);
+      const job = await remoteFinished();
+      expect(job).toMatchObject({ state: 'done', checkpointId: expect.any(String) });
+      expect(job.drawing).toContain('Nothing to draw on');
+      expect((await info()).job).toBeNull();
+    });
+
+    it('reports a failed login, refuses a second run, and can be cancelled', async () => {
+      process.env.FAKE_REMOTE = 'fail';
+      expect((await startRemote({})).status).toBe(202);
+      expect(await remoteFinished()).toMatchObject({ state: 'failed', error: expect.stringContaining('Login failed') });
+
+      process.env.FAKE_REMOTE = 'hang';
+      expect((await startRemote({})).status).toBe(202);
+      await vi.waitFor(async () => expect((await remoteInfo())?.phase).toBe('uploading'));
+      expect((await startRemote({})).status).toBe(409);
+      expect((await send(`/projects/${project.id}/remote`, 'DELETE')).status).toBe(204);
+      expect(await remoteFinished()).toMatchObject({ state: 'cancelled' });
+      expect((await send(`/projects/${project.id}/remote`, 'DELETE')).status).toBe(409);
+      expect((await get(images[11].id)).annotationCount).toBe(0);
+      expect((await info()).checkpoints).toEqual([]);
+    });
+
+    it('validates the request before anything starts', async () => {
+      expect((await send(`/projects/${project.id}/remote`, 'POST', { password: 'x' })).status).toBe(400);
+      expect((await startRemote({ target: 'nohost' })).status).toBe(400);
+      expect((await startRemote({ model: 'xxl' })).status).toBe(400);
+      for (const image of images.slice(0, 5)) await annotate(image.id, []);
+      expect((await startRemote({})).status).toBe(422);
+      expect(await remoteInfo()).toBeNull();
+    });
   });
 
   describe('checkpoints', () => {
@@ -531,7 +739,7 @@ describe('auto box API', () => {
       await train();
       const list = await checkpoints();
       const restarted = new AutoBoxManager(store, { dataDir, command: ['unused'], fileOf: () => '' });
-      expect(restarted.checkpoints({ id: project.id, name: project.name, labels: [car, person] })).toEqual(list);
+      expect(restarted.checkpoints({ id: project.id, name: project.name, labels: [car, person], mode: 'bbox' })).toEqual(list);
     });
 
     it('turns a model saved in the old layout into a checkpoint, once', async () => {
@@ -544,7 +752,7 @@ describe('auto box API', () => {
 
       for (let start = 0; start < 2; start++) {
         const restarted = new AutoBoxManager(store, { dataDir, command: ['unused'], fileOf: () => '' });
-        expect(restarted.checkpoints({ id: 'old-project', name: 'old', labels: [car, person] })).toEqual([{ ...model, id: 'best', projectId: 'old-project', projectName: 'old', canContinue: true, missingLabels: [] }]);
+        expect(restarted.checkpoints({ id: 'old-project', name: 'old', labels: [car, person], mode: 'bbox' })).toEqual([{ ...model, id: 'best', projectId: 'old-project', projectName: 'old', canContinue: true, missingLabels: [] }]);
       }
       expect(readFileSync(join(old, 'best.pt'), 'utf8')).toBe('old model');
       expect(readdirSync(old).sort()).toEqual(['best.json', 'best.pt']);

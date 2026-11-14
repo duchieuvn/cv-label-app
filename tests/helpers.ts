@@ -1,4 +1,4 @@
-import { deflateSync } from 'node:zlib';
+import { deflateSync, inflateRawSync } from 'node:zlib';
 
 function crc32(buffer: Buffer): number {
   let crc = ~0;
@@ -50,4 +50,26 @@ export function withExifOrientation(jpeg: Buffer, orientation: number): Buffer {
   marker.writeUInt16BE(0xffe1, 0);
   marker.writeUInt16BE(payload.length + 2, 2);
   return Buffer.concat([jpeg.subarray(0, 2), marker, payload, jpeg.subarray(2)]);
+}
+
+/** Reads a zip's stored or deflated entries from its central directory. */
+export function unzip(zip: Buffer): Record<string, string> {
+  const result: Record<string, string> = {};
+  let end = zip.length - 22;
+  while (zip.readUInt32LE(end) !== 0x06054b50) end--;
+  let offset = zip.readUInt32LE(end + 16);
+  for (let i = 0; i < zip.readUInt16LE(end + 10); i++) {
+    const method = zip.readUInt16LE(offset + 10);
+    const size = zip.readUInt32LE(offset + 20);
+    const nameLength = zip.readUInt16LE(offset + 28);
+    const extra = zip.readUInt16LE(offset + 30);
+    const comment = zip.readUInt16LE(offset + 32);
+    const local = zip.readUInt32LE(offset + 42);
+    const name = zip.subarray(offset + 46, offset + 46 + nameLength).toString();
+    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
+    const data = zip.subarray(start, start + size);
+    result[name] = (method === 8 ? inflateRawSync(data) : data).toString('latin1');
+    offset += 46 + nameLength + extra + comment;
+  }
+  return result;
 }

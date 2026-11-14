@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { constants, existsSync, mkdirSync } from 'node:fs';
+import { constants, createWriteStream, existsSync, mkdirSync } from 'node:fs';
 import { access, readFile, realpath, rename, rm, stat } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
@@ -14,16 +14,30 @@ import {
   findLabelModeError,
   imageStatusSchema,
   importOptionsSchema,
+  openBundleSchema,
+  remoteBundleSchema,
+  remoteResultsSchema,
   saveAnnotationsSchema,
+  startRemoteSchema,
   startAutoBoxSchema,
   startScanSchema,
   updateProjectSchema,
   type AutoBoxCheckpoint,
+  type BundlePreview,
+  type OpenBundleResult,
   type ImageMeta,
   type Label,
+  type Project,
+  type ProjectMode,
+  type RemoteBundleOptions,
+  type RemoteResults,
+  type RemoteResultsSummary,
   type UploadResult,
 } from '../shared/schema.ts';
-import { AutoBoxManager, labelsForClasses, MIN_TRAINING_IMAGES, TRAINING } from './autobox.ts';
+import { bundleFolders, BundleError, buildBundle, parseBundle, planOpen, samplePaths, serializeBundle } from './bundle.ts';
+import { AutoBoxManager, baseWeights, labelsForClasses, MIN_TRAINING_IMAGES, taskOf, TRAINING } from './autobox.ts';
+import { convertResults, planBundle, START_WEIGHTS } from './remote.ts';
+import { RemoteJobManager } from './remoteJob.ts';
 import { selectImages, selectLabeledImages, toCoco, toImageLabels, toNativeJson, toYolo } from './export.ts';
 import { inspectImage } from './imageInfo.ts';
 import { ImportFileError, parseDataset, planImport } from './import.ts';
@@ -31,6 +45,8 @@ import { ScanManager } from './scan.ts';
 import { createStore } from './store.ts';
 
 const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+/** A project bundle holds no images, but a large project's annotations are still tens of megabytes gzipped. */
+const MAX_BUNDLE_BYTES = 256 * 1024 * 1024;
 
 class HttpError extends Error {
   status: number;
@@ -67,16 +83,19 @@ export type AppOptions = {
   python?: string;
   /** Replaces the auto box worker command entirely. The job file's path is added as its last argument. */
   autoBoxCommand?: string[];
+  /** Replaces the command that runs scripts/remote_train.py for one-click remote runs. */
+  remoteCommand?: string[];
 };
 
-type Checkpoints = { own: AutoBoxCheckpoint[]; other: AutoBoxCheckpoint[] };
+/** `base` is the project's base weights: yolov8n.pt, or yolov8n-pose.pt in a keypoint project. */
+type Checkpoints = { own: AutoBoxCheckpoint[]; other: AutoBoxCheckpoint[]; base: string };
 
 /**
  * The checkpoint to draw with, which defaults to the project's newest. Another project's must be named, so a
  * default never reaches across projects. The base weights know COCO's classes, not a project's labels.
  */
-function pickCheckpointToDraw({ own, other }: Checkpoints, picked: string | undefined): AutoBoxCheckpoint {
-  if (picked === TRAINING.weights) throw new HttpError(422, `${TRAINING.weights} does not know this project's labels, so it cannot draw. Choose a trained checkpoint.`);
+function pickCheckpointToDraw({ own, other, base }: Checkpoints, picked: string | undefined): AutoBoxCheckpoint {
+  if (picked === base) throw new HttpError(422, `${base} does not know this project's labels, so it cannot draw. Choose a trained checkpoint.`);
   if (picked === undefined && own.length === 0) throw new HttpError(422, 'This project has no trained model yet. Train one first, or choose another project\'s checkpoint.');
   const checkpoint = picked === undefined ? own[0] : [...own, ...other].find((c) => c.id === picked);
   if (!checkpoint) throw new HttpError(422, 'That checkpoint no longer exists.');
@@ -84,12 +103,12 @@ function pickCheckpointToDraw({ own, other }: Checkpoints, picked: string | unde
 }
 
 /** The checkpoint to start training from, which defaults to the project's newest usable one. Null means the base weights. */
-function pickCheckpointToTrain({ own, other }: Checkpoints, picked: string | undefined): AutoBoxCheckpoint | null {
-  if (picked === TRAINING.weights) return null;
+function pickCheckpointToTrain({ own, other, base }: Checkpoints, picked: string | undefined): AutoBoxCheckpoint | null {
+  if (picked === base) return null;
   if (picked === undefined) return own.find((c) => c.canContinue) ?? null;
   const checkpoint = [...own, ...other].find((c) => c.id === picked);
   if (!checkpoint) throw new HttpError(422, 'That checkpoint no longer exists.');
-  if (!checkpoint.canContinue) throw new HttpError(422, `Labels were added or removed since that checkpoint was trained, so training cannot continue from it. Start from ${TRAINING.weights}, or draw with it instead.`);
+  if (!checkpoint.canContinue) throw new HttpError(422, `Labels were added or removed since that checkpoint was trained, so training cannot continue from it. Start from ${base}, or draw with it instead.`);
   return checkpoint;
 }
 
@@ -104,6 +123,7 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
   mkdirSync(tmpDir, { recursive: true });
 
   const upload = multer({ dest: tmpDir, limits: { fileSize: MAX_UPLOAD_BYTES } });
+  const bundleUpload = multer({ dest: tmpDir, limits: { fileSize: MAX_BUNDLE_BYTES } });
   const app = express();
   app.disable('x-powered-by');
 
@@ -121,12 +141,25 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
   });
   app.use('/api', express.json({ limit: '50mb' }));
 
+  // Console log of what changes state and of every failure. Status polls stay quiet.
+  app.use('/api', (req, res, next) => {
+    const started = Date.now();
+    res.on('finish', () => {
+      if (req.method === 'GET' && res.statusCode < 400) return;
+      console.log(`${new Date().toISOString()} ${req.method} ${req.originalUrl} ${res.statusCode} ${Date.now() - started}ms`);
+    });
+    next();
+  });
+
   const imageQuery = z.object({
     status: imageStatusSchema.optional(),
     folder: z.string().min(1).optional(),
     recursive: z.enum(['0', '1']).optional(),
     label: z.string().min(1).optional(),
   });
+
+  // Form fields arrive as strings, so flags are accepted as 1/0 or true/false.
+  const flag = z.preprocess((v) => (v === '1' || v === 'true' ? true : v === '0' || v === 'false' ? false : v), z.boolean());
 
   const requireProject = (id: string) => {
     const project = store.getProject(id);
@@ -186,6 +219,10 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
     command: options.autoBoxCommand ?? [options.python ?? 'python3', resolve(import.meta.dirname, 'autobox_worker.py')],
     fileOf: imagePath,
   });
+  const remote = new RemoteJobManager({
+    dataDir,
+    command: options.remoteCommand ?? [options.python ?? 'python3', resolve(import.meta.dirname, '../scripts/remote_train.py')],
+  });
 
   app.get('/api/projects', (_req, res) => {
     res.json(store.listProjects());
@@ -196,6 +233,88 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
     const modeError = findLabelModeError(body.labels, body.mode);
     if (modeError) throw new HttpError(422, modeError);
     res.status(201).json(store.createProject(body.name, body.labels, body.mode));
+  });
+
+  // Opens a project bundle as a new project. See specs.md section 13.
+  app.post('/api/projects/open', bundleUpload.single('file'), async (req, res) => {
+    const file = req.file;
+    try {
+      if (!file) throw new HttpError(400, 'Attach the project file as the "file" field.');
+      const { dryRun } = parse(z.object({ dryRun: flag.optional() }), { dryRun: req.body?.dryRun });
+      let rawOptions: unknown = {};
+      if (typeof req.body?.options === 'string' && req.body.options !== '') {
+        try {
+          rawOptions = JSON.parse(req.body.options);
+        } catch {
+          throw new HttpError(400, 'options is not valid JSON.');
+        }
+      }
+      const options = parse(openBundleSchema, rawOptions);
+      let bundle;
+      try {
+        bundle = await parseBundle(await readFile(file.path));
+      } catch (error) {
+        if (error instanceof BundleError) throw new HttpError(400, error.message);
+        throw error;
+      }
+
+      // Each chosen folder goes through the same checks as adding a folder to a project.
+      const folders = bundleFolders(bundle);
+      const resolved = new Map<string, string>();
+      const errors = new Map<string, HttpError>();
+      for (const folder of folders) {
+        const input = options.paths[folder.key]?.trim();
+        if (!input) continue;
+        try {
+          const path = await resolveFolder(input);
+          const overlap = folders.find((other) => resolved.has(other.key) && (isInside(path, resolved.get(other.key)!) || isInside(resolved.get(other.key)!, path)));
+          if (overlap) throw new HttpError(409, `This folder overlaps the one chosen for "${overlap.name}".`);
+          resolved.set(folder.key, path);
+        } catch (error) {
+          if (!(error instanceof HttpError)) throw error;
+          errors.set(folder.key, error);
+        }
+      }
+
+      if (dryRun) {
+        const preview: BundlePreview = {
+          name: options.name ?? bundle.project.name,
+          mode: bundle.project.mode,
+          labelCount: bundle.project.labels.length,
+          imageCount: bundle.images.length,
+          folders: await Promise.all(
+            folders.map(async (folder) => {
+              const path = resolved.get(folder.key) ?? null;
+              const checks = path ? samplePaths(bundle, folder.key) : [];
+              const found = await Promise.all(checks.map((p) => stat(join(path!, p)).then((s) => s.isFile(), () => false)));
+              return {
+                ...folder,
+                samples: samplePaths(bundle, folder.key, 3),
+                path,
+                error: errors.get(folder.key)?.message ?? null,
+                found: found.filter(Boolean).length,
+                checked: checks.length,
+              };
+            }),
+          ),
+        };
+        res.json(preview);
+        return;
+      }
+
+      const [firstError] = errors.values();
+      if (firstError) {
+        const folder = folders.find((f) => errors.get(f.key) === firstError)!;
+        throw new HttpError(firstError.status, `${folder.name}: ${firstError.message}`);
+      }
+      const plan = planOpen(bundle, resolved, options.name);
+      const created = store.createProjectFromBundle(plan);
+      for (const source of created.sources) scans.start(source, { includeExcluded: false });
+      const result: OpenBundleResult = { project: created.project, warnings: plan.warnings };
+      res.status(201).json(result);
+    } finally {
+      if (file) await rm(file.path, { force: true });
+    }
   });
 
   app.get('/api/projects/:id', (req, res) => {
@@ -249,20 +368,21 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
   });
 
   /** Checkpoints a project can use: its own, and those of every other bounding box project. */
-  const checkpointsFor = (project: { id: string; name: string; labels: Label[] }): Checkpoints => ({
+  const checkpointsFor = (project: { id: string; name: string; labels: Label[]; mode: ProjectMode }): Checkpoints => ({
     own: autoBox.checkpoints(project),
-    other: autoBox.otherCheckpoints(project, store.listProjects().filter((p) => p.mode === 'bbox')),
+    other: autoBox.otherCheckpoints(project, store.listProjects()),
+    base: baseWeights(taskOf(project.mode)),
   });
 
   app.get('/api/projects/:id/autobox', (req, res) => {
     const project = requireProject(req.params.id);
-    const { own: checkpoints, other } = checkpointsFor(project);
+    const { own: checkpoints, other, base } = checkpointsFor(project);
     res.json({
       job: autoBox.get(req.params.id),
       checkpoints,
       otherCheckpoints: other,
-      baseCheckpoint: TRAINING.weights,
-      defaultCheckpoint: checkpoints.find((c) => c.canContinue)?.id ?? TRAINING.weights,
+      baseCheckpoint: base,
+      defaultCheckpoint: checkpoints.find((c) => c.canContinue)?.id ?? base,
       defaultPatience: TRAINING.patience,
       maxEpochs: TRAINING.maxEpochs,
       defaultConfidence: TRAINING.confidence,
@@ -274,13 +394,12 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
   app.post('/api/projects/:id/autobox', (req, res) => {
     let project = requireProject(req.params.id);
     const { mode, confidence, checkpoint: picked, patience } = parse(startAutoBoxSchema, req.body ?? {});
-    if (project.mode !== 'bbox') throw new HttpError(422, 'Auto boxing is only available in bounding box projects.');
     if (autoBox.isAnyRunning()) throw new HttpError(409, 'An auto box job is already running. Only one runs at a time.');
     const { trainable, targets } = store.autoBoxCounts(project.id);
     const saved = checkpointsFor(project);
     const checkpoint = mode === 'predict' ? pickCheckpointToDraw(saved, picked) : pickCheckpointToTrain(saved, picked);
     if (patience !== undefined && (mode === 'predict' || !checkpoint)) {
-      throw new HttpError(422, `Patience can only be chosen when training from a saved checkpoint. ${TRAINING.weights} always uses ${TRAINING.patience}.`);
+      throw new HttpError(422, `Patience can only be chosen when training from a saved checkpoint. ${saved.base} always uses ${TRAINING.patience}.`);
     }
     if (mode === 'train' && trainable < MIN_TRAINING_IMAGES) {
       throw new HttpError(422, `Auto boxing needs at least ${MIN_TRAINING_IMAGES} images with saved boxes. This project has ${trainable}.`);
@@ -295,8 +414,171 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
         project = requireProject(project.id);
       }
     }
-    const options = { mode, confidence: confidence ?? TRAINING.confidence, patience: patience ?? TRAINING.patience, checkpoint };
+    const options = { mode, task: taskOf(project.mode), confidence: confidence ?? TRAINING.confidence, patience: patience ?? TRAINING.patience, checkpoint };
     res.status(202).json(autoBox.start(project.id, project.labels, store.autoBoxImages(project.id), options));
+  });
+
+  // Remote training (specs.md section 10): a bundle goes out, results and weights come back.
+
+  /** Checks a project is ready and returns the bundle plan plus a writer. Nothing is recorded until written. */
+  const prepareBundle = (project: Project, options: RemoteBundleOptions) => {
+    const checkpoint = options.checkpoint === undefined ? null : pickCheckpointToTrain(checkpointsFor(project), options.checkpoint);
+    const { training } = store.autoBoxImages(project.id);
+    if (training.length < MIN_TRAINING_IMAGES) {
+      throw new HttpError(422, `Training needs at least ${MIN_TRAINING_IMAGES} images with saved annotations. This project has ${training.length}.`);
+    }
+    const plan = planBundle(project, training, options, checkpoint);
+    const missing = plan.files.filter((f) => !existsSync(imagePath(f.image)));
+    if (missing.length > 0) throw new HttpError(422, `${missing.length} image files are unavailable, so the bundle cannot be made. Rescan the folder first.`);
+    const write = (sink: NodeJS.WritableStream) => {
+      store.createBundle(plan.record);
+      const zip = new yazl.ZipFile();
+      zip.addBuffer(Buffer.from(JSON.stringify(plan.job)), 'job.json');
+      zip.addFile(resolve(import.meta.dirname, 'autobox_worker.py'), 'worker.py');
+      if (checkpoint) zip.addFile(autoBox.weightsPath(checkpoint), START_WEIGHTS, { compress: true });
+      for (const file of plan.files) zip.addFile(imagePath(file.image), file.entry, { compress: true });
+      zip.end();
+      zip.outputStream.pipe(sink);
+      return zip.outputStream;
+    };
+    return { plan, checkpoint, write };
+  };
+
+  /** Writes a results file into the project exactly as the local job would, and keeps its weights as a checkpoint. */
+  const applyResults = (project: Project, results: RemoteResults, weightsPath: string | null): RemoteResultsSummary => {
+    const bundle = store.getBundle(results.bundleId);
+    // Only results of a bundle this app issued for this project are accepted: that is what ties the
+    // class numbers, and the weights file, to this project.
+    if (!bundle || bundle.projectId !== project.id) throw new HttpError(422, 'These results do not belong to a bundle made from this project.');
+    if (results.task !== bundle.task) throw new HttpError(422, `The bundle was for ${bundle.task}, but the results are for ${results.task}.`);
+    if (autoBox.isRunning(project.id)) throw new HttpError(409, 'Wait for the auto box job to finish, or cancel it.');
+
+    const ids = results.predictions.map((p) => p.id);
+    const { writes, dropped } = convertResults(bundle, results, project.labels, store.imageSizes(project.id, ids));
+    const summary: RemoteResultsSummary = {
+      bundleId: bundle.id,
+      task: bundle.task,
+      trainedAt: results.trainedAt,
+      trainImages: results.trainImages,
+      epochs: results.epochs,
+      bestMap50: results.bestMap50,
+      predicted: results.predictions.length,
+      boxedImages: 0,
+      annotations: 0,
+      dropped,
+      skipped: results.skipped.slice(0, 100),
+      checkpointAdded: false,
+      checkpointId: null,
+    };
+    for (const write of writes) {
+      // The store refuses an image edited or finished since, so a run never replaces a person's work.
+      if (!store.saveAutoBoxes(write.imageId, write.annotations)) {
+        summary.dropped++;
+        continue;
+      }
+      if (write.annotations.length > 0) {
+        summary.boxedImages++;
+        summary.annotations += write.annotations.length;
+      }
+    }
+    if (weightsPath && results.epochs > 0) {
+      summary.checkpointId = autoBox.importCheckpoint(project.id, weightsPath, {
+        trainedAt: results.trainedAt,
+        trainImages: results.trainImages,
+        epochs: results.epochs,
+        bestMap50: results.bestMap50,
+        classIds: bundle.classIds,
+        classNames: bundle.classNames,
+        task: bundle.task,
+        keypointIds: bundle.keypointIds,
+        modelSize: bundle.modelSize,
+        source: 'remote',
+      });
+      summary.checkpointAdded = true;
+    }
+    return summary;
+  };
+
+  /** Draws locally with a checkpoint the remote run brought back, as the local job would after training. */
+  const drawWithCheckpoint = (projectId: string, checkpointId: string, confidence: number): string => {
+    const project = requireProject(projectId);
+    if (autoBox.isAnyRunning()) return 'Drawing was skipped because an auto box job is running. Use Draw with trained model when it is done.';
+    const { targets } = store.autoBoxCounts(projectId);
+    if (targets === 0) return 'Nothing to draw on: every image already has annotations or is done.';
+    const checkpoint = autoBox.checkpoints(project).find((c) => c.id === checkpointId);
+    if (!checkpoint) return 'The new checkpoint could not be found, so nothing was drawn.';
+    autoBox.start(projectId, project.labels, store.autoBoxImages(projectId), { mode: 'predict', task: taskOf(project.mode), confidence, patience: TRAINING.patience, checkpoint });
+    return `Drawing on ${targets} images here with the new checkpoint.`;
+  };
+
+  const readJson = async (path: string, what: string) => {
+    try {
+      return JSON.parse(await readFile(path, 'utf8')) as unknown;
+    } catch {
+      throw new HttpError(400, `${what} is not valid JSON.`);
+    }
+  };
+
+  app.get('/api/projects/:id/remote/bundle', (req, res) => {
+    const project = requireProject(req.params.id);
+    const { plan, write } = prepareBundle(project, parse(remoteBundleSchema, req.query));
+    const baseName = project.name.replace(/[^\p{L}\p{N}_-]+/gu, '_') || 'project';
+    res.attachment(`${baseName}_remote_${plan.record.id.slice(0, 8)}.zip`);
+    write(res).on('error', () => res.destroy());
+  });
+
+  app.post('/api/projects/:id/remote/results', upload.fields([{ name: 'results', maxCount: 1 }, { name: 'weights', maxCount: 1 }]), async (req, res) => {
+    const files = (req.files ?? {}) as Record<string, Express.Multer.File[] | undefined>;
+    const resultsFile = files.results?.[0];
+    const weightsFile = files.weights?.[0];
+    try {
+      const project = requireProject(req.params.id as string);
+      if (!resultsFile) throw new HttpError(400, 'Attach results.json as the "results" field.');
+      const results = parse(remoteResultsSchema, await readJson(resultsFile.path, 'results.json'));
+      res.json(applyResults(project, results, weightsFile?.path ?? null));
+    } finally {
+      await Promise.all([resultsFile, weightsFile].map((f) => (f ? rm(f.path, { force: true }) : undefined)));
+    }
+  });
+
+  app.get('/api/projects/:id/remote', (req, res) => {
+    requireProject(req.params.id);
+    res.json(remote.get(req.params.id));
+  });
+
+  app.post('/api/projects/:id/remote', (req, res) => {
+    const project = requireProject(req.params.id);
+    const { target, password, keepOriginals, ...options } = parse(startRemoteSchema, req.body ?? {});
+    if (remote.isRunning(project.id)) throw new HttpError(409, 'A remote run is already going for this project.');
+    if (autoBox.isRunning(project.id)) throw new HttpError(409, 'Wait for the auto box job to finish, or cancel it.');
+    const { plan, write } = prepareBundle(project, options);
+    const status = remote.start(project.id, {
+      target,
+      password,
+      modelSize: plan.record.modelSize,
+      keepOriginals,
+      bundle: (path) =>
+        new Promise<string>((done, fail) => {
+          const sink = createWriteStream(path);
+          sink.on('finish', () => done(plan.record.id));
+          sink.on('error', fail);
+          write(sink).on('error', fail);
+        }),
+      importResults: async (dir) => {
+        const current = requireProject(project.id);
+        const results = parse(remoteResultsSchema, await readJson(join(dir, 'results.json'), 'results.json'));
+        const weights = join(dir, 'best.pt');
+        return applyResults(current, results, existsSync(weights) ? weights : null);
+      },
+      draw: (checkpointId) => drawWithCheckpoint(project.id, checkpointId, options.confidence),
+    });
+    res.status(202).json(status);
+  });
+
+  app.delete('/api/projects/:id/remote', (req, res) => {
+    requireProject(req.params.id);
+    if (!remote.cancel(req.params.id)) throw new HttpError(409, 'No remote run is going for this project.');
+    res.status(204).end();
   });
 
   app.delete('/api/projects/:id/autobox', (req, res) => {
@@ -350,6 +632,19 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
     res.status(202).json(scans.start(source, { includeExcluded }));
   });
 
+  app.patch('/api/sources/:id', async (req, res) => {
+    const source = requireSource(req.params.id);
+    const path = await resolveFolder(parse(createSourceSchema, req.body).path);
+    const overlap = store
+      .listSources(source.projectId)
+      .find((s) => s.id !== source.id && (isInside(path, s.path) || isInside(s.path, path)));
+    if (overlap) throw new HttpError(409, `This folder overlaps ${overlap.path}, which is already in the project.`);
+    if (scans.isRunning(source.id)) throw new HttpError(409, 'This folder is being scanned. Cancel the scan first.');
+    store.moveSource(source.id, path);
+    const moved = store.getSource(source.id)!;
+    res.status(202).json({ ...moved, scan: scans.start(moved, { includeExcluded: false }) });
+  });
+
   app.delete('/api/sources/:id/scan', (req, res) => {
     requireSource(req.params.id);
     if (!scans.cancel(req.params.id)) throw new HttpError(409, 'No scan is running for this folder.');
@@ -398,7 +693,6 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
     res.status(201).json(result);
   });
 
-  const flag = z.preprocess((v) => (v === '1' || v === 'true' ? true : v === '0' || v === 'false' ? false : v), z.boolean());
   const importFields = z.object({ createLabels: flag.optional(), overwrite: flag.optional(), markDone: flag.optional(), dryRun: flag.optional() });
 
   app.post('/api/projects/:id/import', upload.single('file'), async (req, res) => {
@@ -408,12 +702,7 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
       if (!file) throw new HttpError(400, 'Attach the annotation file as the "file" field.');
       // Form fields arrive as strings, so flags are accepted as 1/0 or true/false.
       const options = parse(importOptionsSchema, parse(importFields, req.body ?? {}));
-      let data: unknown;
-      try {
-        data = JSON.parse(await readFile(file.path, 'utf8'));
-      } catch {
-        throw new HttpError(400, 'The file is not valid JSON.');
-      }
+      const data = await readJson(file.path, 'The file');
       let dataset;
       try {
         dataset = parseDataset(data);
@@ -483,17 +772,26 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
   });
 
   const exportQuery = z.object({
-    format: z.enum(['json', 'coco', 'yolo', 'image_labels']),
+    format: z.enum(['json', 'coco', 'yolo', 'image_labels', 'project']),
     scope: z.enum(['done', 'annotated', 'labeled']).optional(),
     includeImages: z.enum(['0', '1']).default('0'),
   });
 
-  app.get('/api/projects/:id/export', (req, res) => {
+  app.get('/api/projects/:id/export', async (req, res) => {
     const project = requireProject(req.params.id);
     const query = parse(exportQuery, req.query);
+    const baseName = project.name.replace(/[^\p{L}\p{N}_-]+/gu, '_') || 'export';
+
+    if (query.format === 'project') {
+      // A copy of the project for another computer: every image, no files. See specs.md section 13.
+      const bundle = buildBundle(project, store.listSources(project.id), store.listProjectExclusions(project.id), store.listImagesForBundle(project.id));
+      const data = await serializeBundle(bundle);
+      res.attachment(`${baseName}.labelapp`).type('application/octet-stream').send(data);
+      return;
+    }
+
     const all = store.listImagesWithAnnotations(project.id);
     const sourcePaths = new Map(store.listSources(project.id).map((s) => [s.id, s.path]));
-    const baseName = project.name.replace(/[^\p{L}\p{N}_-]+/gu, '_') || 'export';
 
     const fileOf = (image: (typeof all)[number]) =>
       imagePath({ ...image, sourcePath: image.sourceId ? (sourcePaths.get(image.sourceId) ?? null) : null });
@@ -568,10 +866,12 @@ export function createApp(dataDir: string, options: AppOptions = {}) {
       return;
     }
     if (error instanceof HttpError) {
+      if (error.status >= 500 || error.status === 422) console.log(`${error.status}: ${error.message}`);
       res.status(error.status).json({ error: error.message });
     } else if (error instanceof multer.MulterError) {
       const tooLarge = error.code === 'LIMIT_FILE_SIZE';
-      res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? 'File is larger than the 100 MB limit' : error.message });
+      const limit = error.field === 'file' && _req.path === '/api/projects/open' ? MAX_BUNDLE_BYTES : MAX_UPLOAD_BYTES;
+      res.status(tooLarge ? 413 : 400).json({ error: tooLarge ? `File is larger than the ${limit / 1024 / 1024} MB limit` : error.message });
     } else if (error instanceof SyntaxError && 'body' in error) {
       res.status(400).json({ error: 'Invalid JSON' });
     } else {

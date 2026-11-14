@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type DragEvent, type FormEvent } from 'react';
-import type { AutoBoxCheckpoint, AutoBoxInfo, AutoBoxStatus, FolderNode, ImageMeta, ImageStatus, ImportResult, ImportSummary, Label, Project, Source, UploadResult } from '../../../shared/schema.ts';
+import type { AutoBoxCheckpoint, AutoBoxInfo, AutoBoxStatus, FolderNode, ImageMeta, ImageStatus, ImportResult, ImportSummary, Label, Project, RemoteJobStatus, RemoteResultsSummary, Source, UploadResult } from '../../../shared/schema.ts';
 import { newId, nextLabelColor } from '../annotate/doc.ts';
 import { MODES } from '../modes.ts';
 import { api, imageUrl, saveQueue, type BulkRequest } from '../api.ts';
@@ -61,7 +61,51 @@ function describeImport(s: ImportSummary, dryRun: boolean): string[] {
 
 function describeCheckpoint(c: AutoBoxCheckpoint): string {
   const accuracy = c.bestMap50 === null ? '' : `, mAP50 ${c.bestMap50.toFixed(2)}`;
-  return `${new Date(c.trainedAt).toLocaleString()}: ${count(c.trainImages)}, ${c.epochs} epochs${accuracy}`;
+  const model = `yolov8${c.modelSize ?? 'n'}${c.task === 'pose' ? '-pose' : ''}${c.source === 'remote' ? ', remote' : ''}`;
+  return `${new Date(c.trainedAt).toLocaleString()}: ${count(c.trainImages)}, ${c.epochs} epochs${accuracy} (${model})`;
+}
+
+const PHASES: Record<RemoteJobStatus['phase'], string> = {
+  bundling: 'Making the bundle',
+  connecting: 'Connecting to the server',
+  preparing: 'Checking the server\'s conda environment (the first run installs it, which takes a while)',
+  installing: 'Installing PyTorch and ultralytics on the server, once',
+  uploading: 'Uploading the bundle',
+  training: 'Training on the server',
+  downloading: 'Downloading the trained model',
+  importing: 'Adding the checkpoint',
+  drawing: 'Drawing here with the new checkpoint',
+};
+
+/** The remote run's status line, phrased like the local job's. */
+function describeRemote(job: RemoteJobStatus, unit: [string, string]): string {
+  const where = ` on ${job.target}`;
+  if (job.state === 'running') {
+    const mb = (n: number) => `${(n / 1e6).toFixed(1)} MB`;
+    const detail =
+      job.phase === 'uploading' && job.uploadTotal > 0
+        ? `: ${mb(job.uploaded)} of ${mb(job.uploadTotal)}`
+        : job.phase === 'training' && job.epoch > 0
+          ? `: epoch ${job.epoch}${job.bestMap50 === null ? '' : `, best mAP50 ${job.bestMap50.toFixed(2)}`}`
+          : '';
+    const gpu = job.gpu ? ` GPU: ${job.gpu}.` : '';
+    return `${PHASES[job.phase]}${['bundling', 'importing', 'drawing'].includes(job.phase) ? '' : where}${detail}.${gpu}`;
+  }
+  if (job.state === 'failed') return `Remote run failed${where}: ${job.error}`;
+  if (job.state === 'cancelled') {
+    const hint = job.bundleId && job.phase === 'training' ? ` The server may still be training; collect it later with: python scripts/remote_train.py fetch ${job.bundleId} ${job.target}` : '';
+    return `Remote run cancelled.${hint}`;
+  }
+  const trained = job.summary ? ` Trained on ${count(job.summary.trainImages)}, ${job.summary.epochs} epochs${job.summary.bestMap50 === null ? '' : `, best mAP50 ${job.summary.bestMap50.toFixed(2)}`}.` : '';
+  void unit;
+  return `Finished training${where}.${trained} ${job.drawing ?? ''}`.trim();
+}
+
+function describeRemoteResults(r: RemoteResultsSummary): string {
+  const accuracy = r.bestMap50 === null ? '' : `, best mAP50 ${r.bestMap50.toFixed(2)}`;
+  const skipped = r.skipped.length > 0 ? ` The server could not read ${r.skipped.length} files.` : '';
+  const checkpoint = r.checkpointAdded ? ' The trained model was added as a checkpoint: use Draw with trained model.' : ' No trained model came back.';
+  return `Trained on ${count(r.trainImages)}, ${r.epochs} epochs${accuracy}.${skipped}${checkpoint}`;
 }
 
 function describeAutoBox(job: AutoBoxStatus): string {
@@ -115,7 +159,7 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [rejected, setRejected] = useState<UploadResult['rejected']>([]);
   const [dragOver, setDragOver] = useState(false);
-  const [format, setFormat] = useState<'coco' | 'yolo' | 'json' | 'image_labels'>('coco');
+  const [format, setFormat] = useState<'coco' | 'yolo' | 'json' | 'image_labels' | 'project'>('coco');
   const [scope, setScope] = useState<'done' | 'annotated'>('done');
   const [labeledScope, setLabeledScope] = useState<'labeled' | 'done'>('labeled');
   const [includeImages, setIncludeImages] = useState(false);
@@ -125,6 +169,25 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   const [importOptions, setImportOptions] = useState<ImportOptions>({ createLabels: true, overwrite: false, markDone: false });
   const [importResult, setImportResult] = useState<ImportResult | null>(null);
   const [importBusy, setImportBusy] = useState(false);
+  const [remoteModel, setRemoteModel] = useState('m');
+  const [remoteEpochs, setRemoteEpochs] = useState('300');
+  const [remotePatience, setRemotePatience] = useState('50');
+  const [remoteImgsz, setRemoteImgsz] = useState('640');
+  const [remoteResultsFile, setRemoteResultsFile] = useState<File | null>(null);
+  const [remoteWeightsFile, setRemoteWeightsFile] = useState<File | null>(null);
+  const [remoteSummary, setRemoteSummary] = useState<RemoteResultsSummary | null>(null);
+  const [remoteBusy, setRemoteBusy] = useState(false);
+  const remoteResultsInput = useRef<HTMLInputElement>(null);
+  const remoteWeightsInput = useRef<HTMLInputElement>(null);
+  const [remoteJob, setRemoteJob] = useState<RemoteJobStatus | null>(null);
+  const [remoteTarget, setRemoteTarget] = useState(() => {
+    try {
+      return localStorage.getItem('labelapp.remoteTarget') ?? '';
+    } catch {
+      return '';
+    }
+  });
+  const [remotePassword, setRemotePassword] = useState('');
   /** Only the newest preview may apply, since options can change while one is in flight. */
   const importRequest = useRef(0);
   /** Only the newest list request may apply, since filters can change while one is in flight. */
@@ -134,6 +197,7 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   const refreshFolders = () => api.listFolders(projectId).then(setFolders);
   const refreshSources = () => api.listSources(projectId).then(setSources);
   const refreshAutoBox = () => api.getAutoBox(projectId).then(setAutoBox);
+  const refreshRemote = () => api.getRemote(projectId).then(setRemoteJob);
   const refreshImages = () => {
     const request = ++listRequest.current;
     return api.listImages(projectId, { folder: folder ?? undefined, recursive, label: labelFilter || undefined }).then((list) => {
@@ -205,9 +269,21 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   useEffect(() => {
     refreshAutoBox().catch(report);
   }, [projectId, images]);
+  useEffect(() => {
+    refreshRemote().catch(report);
+  }, [projectId]);
 
   const scanning = sources.some((s) => s.scan?.state === 'running');
   const autoBoxing = autoBox?.job?.state === 'running';
+  const remoting = remoteJob?.state === 'running';
+  useEffect(() => {
+    if (!remoting) return;
+    const timer = setInterval(() => refreshRemote().catch(report), 1000);
+    return () => {
+      clearInterval(timer);
+      Promise.all([refreshRemote(), refreshImages(), refreshAutoBox()]).catch(report);
+    };
+  }, [remoting, folder, recursive, labelFilter]);
   useEffect(() => {
     if (!scanning && !autoBoxing) return;
     let nextListAt = Date.now() + 3000;
@@ -249,6 +325,54 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   const patience = Number(patienceText);
   const patienceValid = Number.isInteger(patience) && patience >= 1 && patience <= (autoBox?.maxEpochs ?? 0);
   const cannotContinue = ownCheckpoints.filter((c) => !c.canContinue).length;
+
+  const startRemote = async () => {
+    setError(null);
+    try {
+      try {
+        localStorage.setItem('labelapp.remoteTarget', remoteTarget);
+      } catch {}
+      const status = await api.startRemote(projectId, {
+        target: remoteTarget,
+        password: remotePassword,
+        model: remoteModel,
+        epochs: Number(remoteEpochs),
+        patience: Number(remotePatience),
+        imgsz: Number(remoteImgsz),
+        confidence,
+        checkpoint: fromBase ? undefined : trainFrom,
+      });
+      // The password was for this one login; the page forgets it as the server does.
+      setRemotePassword('');
+      setRemoteJob(status);
+    } catch (e) {
+      report(e);
+    }
+  };
+
+  const cancelRemote = async () => {
+    await api.cancelRemote(projectId).catch(report);
+    await refreshRemote().catch(report);
+  };
+
+  const importRemoteResults = async () => {
+    if (!remoteResultsFile) return;
+    setRemoteBusy(true);
+    setError(null);
+    try {
+      const summary = await api.importRemoteResults(projectId, remoteResultsFile, remoteWeightsFile);
+      setRemoteSummary(summary);
+      setRemoteResultsFile(null);
+      setRemoteWeightsFile(null);
+      if (remoteResultsInput.current) remoteResultsInput.current.value = '';
+      if (remoteWeightsInput.current) remoteWeightsInput.current.value = '';
+      await Promise.all([refreshImages(), refreshAutoBox()]);
+    } catch (e) {
+      report(e);
+    } finally {
+      setRemoteBusy(false);
+    }
+  };
 
   const startAutoBox = async (mode: 'train' | 'predict') => {
     setError(null);
@@ -348,6 +472,18 @@ export function ProjectPage({ projectId }: { projectId: string }) {
     setError(null);
     try {
       await api.rescan(source.id, includeExcluded);
+      await refreshAfterScanStart();
+    } catch (err) {
+      report(err);
+    }
+  };
+
+  const moveSource = async (source: Source) => {
+    const path = window.prompt(`Where is the folder "${source.name}" now? Enter its absolute path. Annotations are kept, and each file is checked again.`, source.path);
+    if (!path?.trim() || path.trim() === source.path) return;
+    setError(null);
+    try {
+      await api.moveSource(source.id, path.trim());
       await refreshAfterScanStart();
     } catch (err) {
       report(err);
@@ -535,11 +671,15 @@ export function ProjectPage({ projectId }: { projectId: string }) {
   const canAdd = bulkLabel === NEW_LABEL ? newLabelName.trim() !== '' : Boolean(chosenLabel);
   const labelsOnSelection = labels.filter((l) => selectedLabelCounts.has(l.id));
 
-  const exportParams = new URLSearchParams({
-    format,
-    scope: format === 'image_labels' ? labeledScope : scope,
-    includeImages: (format === 'yolo' || format === 'image_labels') && includeImages ? '1' : '0',
-  });
+  const exportParams = new URLSearchParams(
+    format === 'project'
+      ? { format }
+      : {
+          format,
+          scope: format === 'image_labels' ? labeledScope : scope,
+          includeImages: (format === 'yolo' || format === 'image_labels') && includeImages ? '1' : '0',
+        },
+  );
 
   const hidden = (node: FolderNode): boolean => {
     // A folder's ancestors are simply the prefixes of its path.
@@ -657,6 +797,9 @@ export function ProjectPage({ projectId }: { projectId: string }) {
                   <button className="btn" title="Also brings back images you deleted from this project" onClick={() => rescan(source, true)}>
                     Rescan and restore deleted
                   </button>
+                  <button className="btn" title="Point this folder at another path on disk" onClick={() => moveSource(source)}>
+                    Change path
+                  </button>
                 </>
               )}
               <button className="btn danger" onClick={() => removeSource(source)}>
@@ -689,11 +832,11 @@ export function ProjectPage({ projectId }: { projectId: string }) {
       </section>
 
       {mode?.autoBox && autoBox && (project?.imageCount ?? 0) > 0 && (
-        <section className="sources" aria-label="Auto bounding box">
-          <h2>Auto bounding box</h2>
+        <section className="sources" aria-label={mode.autoName}>
+          <h2>{mode.autoName}</h2>
           <p className="muted">
-            Trains a YOLOv8 nano model on the {count(autoBox.trainable)} with saved boxes, then draws boxes on {count(autoBox.targets)} still todo that you have not annotated. Drawn boxes are marked <em>auto</em>, and drawing again replaces them. They are not
-            exported or trained on until you edit the image or mark it done.
+            Trains a YOLOv8{mode.modelSuffix} nano model on the {count(autoBox.trainable)} with saved {mode.autoUnit[1]}, then draws {mode.autoUnit[1]} on {count(autoBox.targets)} still todo that you have not annotated. Drawn {mode.autoUnit[1]} are marked <em>auto</em>, and
+            drawing again replaces them. They are not exported or trained on until you edit the image or mark it done.
           </p>
           <div className="autobox-confidence">
             <label>
@@ -791,11 +934,117 @@ export function ProjectPage({ projectId }: { projectId: string }) {
             )}
             {!autoBoxing && autoBox.autoBoxed > 0 && (
               <button className="btn danger" onClick={clearAutoBoxes}>
-                Remove predicted boxes ({autoBox.autoBoxed.toLocaleString()})
+                Remove predicted {mode.autoUnit[1]} ({autoBox.autoBoxed.toLocaleString()})
               </button>
             )}
-            {!autoBoxing && autoBox.trainable < autoBox.minTraining && <span className="muted">Training needs at least {autoBox.minTraining} images with saved boxes.</span>}
+            {!autoBoxing && autoBox.trainable < autoBox.minTraining && <span className="muted">Training needs at least {autoBox.minTraining} images with saved {mode.autoUnit[1]}.</span>}
           </div>
+          <details className="remote-training" data-testid="remote-training" open={remoting || remoteJob !== null}>
+            <summary>Train on a remote server</summary>
+            <p className="muted">
+              A larger model can train on a machine with a GPU. The app bundles only the {count(autoBox.trainable)} with saved {mode.autoUnit[1]}, uploads them over SSH, trains there, downloads the trained model as a checkpoint, and then draws here with it on the{' '}
+              {count(autoBox.targets)} still todo, exactly as a local run would. The rest of the dataset never leaves this machine. The password is used for one login and is not stored; leave it empty to use your SSH key. Training starts from{' '}
+              {fromBase ? `the base yolov8${remoteModel}${mode.modelSuffix}.pt weights` : 'the checkpoint chosen in Train from, which fixes the model size'}.
+            </p>
+            <div className="autobox-actions">
+              <label>
+                Server
+                <input type="text" placeholder="user@host" value={remoteTarget} disabled={remoting} onChange={(e) => setRemoteTarget(e.target.value)} />
+              </label>
+              <label>
+                Password
+                <input type="password" autoComplete="off" value={remotePassword} disabled={remoting} onChange={(e) => setRemotePassword(e.target.value)} />
+              </label>
+              <label>
+                Remote model
+                <select value={remoteModel} disabled={!fromBase || remoting} onChange={(e) => setRemoteModel(e.target.value)}>
+                  <option value="n">YOLOv8{mode.modelSuffix} nano</option>
+                  <option value="s">YOLOv8{mode.modelSuffix} small</option>
+                  <option value="m">YOLOv8{mode.modelSuffix} medium</option>
+                  <option value="l">YOLOv8{mode.modelSuffix} large</option>
+                  <option value="x">YOLOv8{mode.modelSuffix} extra large</option>
+                </select>
+              </label>
+              <label>
+                Remote epochs
+                <input type="number" min={1} max={1000} step={1} value={remoteEpochs} disabled={remoting} onChange={(e) => setRemoteEpochs(e.target.value)} />
+              </label>
+              <label>
+                Remote patience
+                <input type="number" min={1} max={1000} step={1} value={remotePatience} disabled={remoting} onChange={(e) => setRemotePatience(e.target.value)} />
+              </label>
+              <label>
+                Remote image size
+                <select value={remoteImgsz} disabled={remoting} onChange={(e) => setRemoteImgsz(e.target.value)}>
+                  {[480, 640, 800, 960, 1280].map((n) => (
+                    <option key={n} value={String(n)}>
+                      {n}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="autobox-actions">
+              {!remoting && (
+                <button className="btn primary" disabled={autoBoxing || !remoteTarget.trim() || autoBox.trainable < autoBox.minTraining} onClick={startRemote}>
+                  Train on server and draw
+                </button>
+              )}
+              {remoting && (
+                <button className="btn" onClick={cancelRemote}>
+                  Cancel
+                </button>
+              )}
+              {remoteJob && (
+                <span className="scan-line" data-testid="remote-status" role={remoteJob.state === 'failed' ? 'alert' : 'status'}>
+                  {describeRemote(remoteJob, mode.autoUnit)}
+                </span>
+              )}
+            </div>
+            <details className="remote-manual">
+              <summary>Manual steps</summary>
+              <p className="muted">The same run by hand: download the bundle, run the script in a terminal, import the model it brings back, and then use Draw with trained model.</p>
+              <div className="autobox-actions">
+                <a
+                  className={`btn${autoBox.trainable < autoBox.minTraining ? ' disabled' : ''}`}
+                  aria-disabled={autoBox.trainable < autoBox.minTraining}
+                  href={`/api/projects/${projectId}/remote/bundle?${new URLSearchParams({
+                    model: remoteModel,
+                    epochs: remoteEpochs,
+                    patience: remotePatience,
+                    imgsz: remoteImgsz,
+                    confidence: confidence.toFixed(2),
+                    ...(fromBase ? {} : { checkpoint: trainFrom }),
+                  })}`}
+                  download
+                  onClick={(e) => {
+                    if (autoBox.trainable < autoBox.minTraining) e.preventDefault();
+                  }}
+                >
+                  Download bundle
+                </a>
+                <code>conda activate ml && python scripts/remote_train.py train ~/Downloads/{'<'}bundle{'>'}.zip {remoteTarget.trim() || 'user@host'}</code>
+              </div>
+              <div className="autobox-actions">
+                <label>
+                  results.json
+                  <input ref={remoteResultsInput} type="file" accept=".json,application/json" data-testid="remote-results" onChange={(e) => setRemoteResultsFile(e.target.files?.[0] ?? null)} />
+                </label>
+                <label>
+                  best.pt
+                  <input ref={remoteWeightsInput} type="file" accept=".pt" data-testid="remote-weights" onChange={(e) => setRemoteWeightsFile(e.target.files?.[0] ?? null)} />
+                </label>
+                <button className="btn" disabled={!remoteResultsFile || remoteBusy || autoBoxing || remoting} onClick={importRemoteResults}>
+                  Import results
+                </button>
+              </div>
+              {remoteSummary && (
+                <p className="scan-line" data-testid="remote-summary" role="status">
+                  {describeRemoteResults(remoteSummary)}
+                </p>
+              )}
+            </details>
+          </details>
           {autoBox.job && (
             <p className="scan-line" data-testid="autobox-status" role={autoBox.job.state === 'failed' ? 'alert' : undefined}>
               {describeAutoBox(autoBox.job)}
@@ -822,22 +1071,29 @@ export function ProjectPage({ projectId }: { projectId: string }) {
             <option value="yolo">{mode?.yoloFormat}</option>
             <option value="image_labels">Image labels (zip)</option>
             <option value="json">LabelApp JSON</option>
+            <option value="project">Project file, to share with teammates</option>
           </select>
         </label>
-        <label>
-          Images
-          {format === 'image_labels' ? (
-            <select value={labeledScope} onChange={(e) => setLabeledScope(e.target.value as typeof labeledScope)}>
-              <option value="labeled">All with an image label</option>
-              <option value="done">Done, with an image label</option>
-            </select>
-          ) : (
-            <select value={scope} onChange={(e) => setScope(e.target.value as typeof scope)}>
-              <option value="done">Done only</option>
-              <option value="annotated">Done, plus todo with annotations</option>
-            </select>
-          )}
-        </label>
+        {format === 'project' ? (
+          <span className="muted" data-testid="project-export-note">
+            Every image's labels, annotations and status, without the image files. A teammate opens it from the project list and chooses where these folders are on their computer.
+          </span>
+        ) : (
+          <label>
+            Images
+            {format === 'image_labels' ? (
+              <select value={labeledScope} onChange={(e) => setLabeledScope(e.target.value as typeof labeledScope)}>
+                <option value="labeled">All with an image label</option>
+                <option value="done">Done, with an image label</option>
+              </select>
+            ) : (
+              <select value={scope} onChange={(e) => setScope(e.target.value as typeof scope)}>
+                <option value="done">Done only</option>
+                <option value="annotated">Done, plus todo with annotations</option>
+              </select>
+            )}
+          </label>
+        )}
         {(format === 'yolo' || format === 'image_labels') && (
           <label className="check">
             <input type="checkbox" checked={includeImages} onChange={(e) => setIncludeImages(e.target.checked)} />

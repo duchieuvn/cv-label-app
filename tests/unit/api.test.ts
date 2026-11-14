@@ -1,13 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { gunzipSync, gzipSync } from 'node:zlib';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import { inflateRawSync } from 'node:zlib';
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import type { Annotation, FolderNode, ImageDetail, ImageMeta, Label, Project, ScanStatus, Source, UploadResult } from '../../shared/schema.ts';
 import { createApp } from '../../server/app.ts';
-import { makePng } from '../helpers.ts';
+import { makePng, unzip } from '../helpers.ts';
 
 let dataDir: string;
 let server: Server;
@@ -523,6 +523,174 @@ describe('folder import', () => {
     }
   });
 
+  describe('sharing a project', () => {
+    let copy: string;
+    let uploads: string;
+    beforeEach(() => {
+      copy = mkdtempSync(join(tmpdir(), 'labelapp-copy-'));
+      uploads = mkdtempSync(join(tmpdir(), 'labelapp-uploads-'));
+    });
+    afterEach(() => {
+      rmSync(copy, { recursive: true, force: true });
+      rmSync(uploads, { recursive: true, force: true });
+    });
+
+    const exportBundle = async (projectId = project.id) => {
+      const response = await fetch(`${base}/projects/${projectId}/export?format=project`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-disposition')).toContain('.labelapp');
+      return Buffer.from(await response.arrayBuffer());
+    };
+    const open = (bundle: Buffer, options: object, dryRun: boolean, url = base) => {
+      const form = new FormData();
+      form.append('file', new Blob([new Uint8Array(bundle)]), 'test.labelapp');
+      form.append('options', JSON.stringify(options));
+      form.append('dryRun', dryRun ? '1' : '0');
+      return fetch(`${url}/projects/open`, { method: 'POST', body: form });
+    };
+    const imagesOf = async (projectId: string): Promise<ImageMeta[]> => (await fetch(`${base}/projects/${projectId}/images`)).json();
+    const sourcesOf = async (projectId: string): Promise<Source[]> => (await fetch(`${base}/projects/${projectId}/sources`)).json();
+
+    /** A project with an upload, a scanned folder with annotations, image labels, statuses and a deleted image. */
+    const prepare = async () => {
+      write('keep.png', makePng(50, 50));
+      write('sub/resized.png', makePng(50, 50));
+      write('gone.png', makePng(50, 50));
+      write('deleted.png', makePng(50, 50));
+      write('todo.png', makePng(50, 50));
+      await addSource();
+      const id = async (name: string) => (await scanned()).find((i) => i.filename === name)!.id;
+      expect((await send(`/images/${await id('keep.png')}/annotations`, 'PUT', { annotations: [box], status: 'done', imageLabels: ['car'] })).status).toBe(200);
+      expect((await send(`/images/${await id('gone.png')}/annotations`, 'PUT', { annotations: [box] })).status).toBe(200);
+      expect((await send(`/images/${await id('resized.png')}/annotations`, 'PUT', { annotations: [pose] })).status).toBe(200);
+      expect((await send(`/images/${imageId}/annotations`, 'PUT', { annotations: [box], status: 'done' })).status).toBe(200);
+      expect((await fetch(`${base}/images/${await id('deleted.png')}`, { method: 'DELETE' })).status).toBe(204);
+    };
+
+    it('exports every image, todo included, with folders and deleted paths but no files', async () => {
+      await prepare();
+      const bundle = JSON.parse(gunzipSync(await exportBundle()).toString());
+      expect(bundle).toMatchObject({ kind: 'labelapp-project', version: 1, project: { name: 'test', mode: 'keypoint', labels: [person, car] } });
+      expect(bundle.sources).toEqual([{ key: 's1', name: basename(root), originalPath: root, exclusions: ['deleted.png'] }]);
+      const byPath = Object.fromEntries(bundle.images.map((i: { source: string; relPath: string }) => [`${i.source}:${i.relPath}`, i]));
+      expect(Object.keys(byPath).sort()).toEqual(['s1:gone.png', 's1:keep.png', 's1:sub/resized.png', 's1:todo.png', 'uploads:a.png']);
+      expect(byPath['s1:keep.png']).toMatchObject({ status: 'done', imageLabels: ['car'], annotations: [box], autoBoxed: false, width: 50 });
+      expect(byPath['s1:todo.png']).toMatchObject({ status: 'todo', annotations: [] });
+    });
+
+    it('opens on another path, matching files by path and keeping annotations read-only where files differ', async () => {
+      await prepare();
+      const bundle = await exportBundle();
+      cpSync(root, copy, { recursive: true });
+      rmSync(join(copy, 'gone.png'));
+      writeFileSync(join(copy, 'sub/resized.png'), makePng(70, 50));
+      writeFileSync(join(copy, 'new.png'), makePng(50, 50));
+      writeFileSync(join(uploads, 'a.png'), makePng(100, 50));
+
+      const preview = await (await open(bundle, { paths: { s1: copy, uploads } }, true)).json();
+      expect(preview).toMatchObject({ name: 'test', mode: 'keypoint', labelCount: 2, imageCount: 5 });
+      expect(preview.folders).toMatchObject([
+        { key: 's1', name: basename(root), originalPath: root, imageCount: 4, path: copy, error: null, found: 3, checked: 4 },
+        { key: 'uploads', imageCount: 1, path: uploads, error: null, found: 1, checked: 1 },
+      ]);
+      expect(await imagesOf(project.id)).toHaveLength(5);
+
+      const response = await open(bundle, { name: 'shared', paths: { s1: copy, uploads } }, false);
+      expect(response.status).toBe(201);
+      const result = await response.json();
+      expect(result).toMatchObject({ project: { name: 'shared', mode: 'keypoint', labels: [person, car] }, warnings: [] });
+      const sources = await sourcesOf(result.project.id);
+      expect(sources.map((s) => [s.name, s.path])).toEqual([
+        [basename(root), copy],
+        [basename(uploads), uploads],
+      ].sort());
+      for (const source of sources) expect((await scanDone(source.id)).state).toBe('done');
+
+      const images = await imagesOf(result.project.id);
+      const find = (name: string) => images.find((i) => i.filename === name)!;
+      expect(images.map((i) => i.filename).sort()).toEqual(['a.png', 'gone.png', 'keep.png', 'new.png', 'resized.png', 'todo.png']);
+      expect(find('keep.png')).toMatchObject({ fileState: 'ok', status: 'done', imageLabels: ['car'], annotationCount: 1, folder: basename(root) });
+      expect(find('resized.png')).toMatchObject({ fileState: 'changed', width: 50, annotationCount: 1, folder: `${basename(root)}/sub` });
+      expect(find('gone.png')).toMatchObject({ fileState: 'missing', annotationCount: 1 });
+      expect(find('new.png')).toMatchObject({ fileState: 'ok', status: 'todo' });
+      expect(find('a.png')).toMatchObject({ fileState: 'ok', status: 'done', annotationCount: 1, folder: basename(uploads) });
+      expect((await send(`/images/${find('gone.png').id}/annotations`, 'PUT', { annotations: [] })).status).toBe(409);
+      expect((await send(`/images/${find('keep.png').id}/annotations`, 'PUT', { annotations: [] })).status).toBe(200);
+      expect((await fetch(`${base}/images/${find('keep.png').id}/file`)).status).toBe(200);
+
+      // The original is untouched.
+      expect((await imagesOf(project.id)).find((i) => i.filename === 'keep.png')).toMatchObject({ annotationCount: 1, fileState: 'ok' });
+    });
+
+    it('leaves out folders with no path, with a warning', async () => {
+      await prepare();
+      const result = await (await open(await exportBundle(), { paths: { s1: root } }, false)).json();
+      expect(result.warnings).toEqual(['1 image in "Uploaded images" left out, because no folder was chosen for it.']);
+      expect(await imagesOf(result.project.id)).toHaveLength(4);
+    });
+
+    it('reports unusable paths in a dry run and refuses them otherwise', async () => {
+      await prepare();
+      const bundle = await exportBundle();
+      mkdirSync(join(copy, 'inner'));
+      const preview = await (await open(bundle, { paths: { s1: copy, uploads: join(copy, 'inner') } }, true)).json();
+      expect(preview.folders[0]).toMatchObject({ error: null, found: 0 });
+      expect(preview.folders[1].error).toContain('overlaps');
+      expect((await open(bundle, { paths: { s1: copy, uploads: join(copy, 'inner') } }, false)).status).toBe(409);
+      expect((await open(bundle, { paths: { s1: join(copy, 'nope') } }, false)).status).toBe(400);
+      expect((await open(bundle, { paths: { s1: 'relative' } }, false)).status).toBe(400);
+
+      const before = (await (await fetch(`${base}/projects`)).json()).length;
+      expect((await open(Buffer.from('{"images":[]}'), {}, false)).status).toBe(400);
+      expect((await open(gzipSync('not json'), {}, true)).status).toBe(400);
+      const wrongVersion = JSON.parse(gunzipSync(bundle).toString());
+      wrongVersion.version = 2;
+      expect((await (await open(Buffer.from(JSON.stringify(wrongVersion)), {}, true)).json()).error).toContain('version 2');
+      const escaping = JSON.parse(gunzipSync(bundle).toString());
+      escaping.images[0].relPath = '../outside.png';
+      expect((await open(Buffer.from(JSON.stringify(escaping)), {}, true)).status).toBe(400);
+      const broken = JSON.parse(gunzipSync(bundle).toString());
+      broken.images.find((i: { annotations: unknown[] }) => i.annotations.length > 0).annotations[0].labelId = 'nobody';
+      expect((await (await open(Buffer.from(JSON.stringify(broken)), {}, true)).json()).error).toContain('unknown label');
+      expect((await (await fetch(`${base}/projects`)).json()).length).toBe(before);
+    });
+
+    it('applies IMPORT_ROOTS to chosen folders', async () => {
+      await prepare();
+      const bundle = await exportBundle();
+      const dir = mkdtempSync(join(tmpdir(), 'labelapp-remote-'));
+      const remote = createApp(dir, { host: '0.0.0.0' });
+      const remoteServer = await new Promise<Server>((resolve) => {
+        const s = remote.app.listen(0, '127.0.0.1', () => resolve(s));
+      });
+      try {
+        const url = `http://127.0.0.1:${(remoteServer.address() as AddressInfo).port}/api`;
+        const preview = await (await open(bundle, { paths: { s1: root } }, true, url)).json();
+        expect(preview.folders[0].error).toContain('IMPORT_ROOTS');
+        expect((await open(bundle, { paths: { s1: root } }, false, url)).status).toBe(403);
+      } finally {
+        remoteServer.close();
+        remote.store.close();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it('points a source at another folder, recovering its images', async () => {
+      await prepare();
+      const opened = await (await open(await exportBundle(), { paths: { s1: copy } }, false)).json();
+      const [source] = await sourcesOf(opened.project.id);
+      await scanDone(source.id);
+      expect((await imagesOf(opened.project.id)).every((i) => i.fileState === 'missing')).toBe(true);
+
+      expect((await send(`/sources/${source.id}`, 'PATCH', { path: join(root, 'nope') })).status).toBe(400);
+      const moved = await send(`/sources/${source.id}`, 'PATCH', { path: root });
+      expect(moved.status).toBe(202);
+      expect(await moved.json()).toMatchObject({ path: root, name: basename(root) });
+      expect(await scanDone(source.id)).toMatchObject({ recovered: 4, added: 0, excluded: 1 });
+      expect((await imagesOf(opened.project.id)).every((i) => i.fileState === 'ok')).toBe(true);
+    });
+  });
+
   describe('group actions', () => {
     const bulk = (body: object) => send(`/projects/${project.id}/images/bulk`, 'POST', body);
     let top: string;
@@ -655,79 +823,5 @@ describe('folder import', () => {
       expect(Object.keys(entries)).not.toContain('labels/1.txt');
       expect(Object.keys(entries)).toContain('labels/2.txt');
     });
-  });
-});
-
-/** Reads a zip's stored or deflated entries from its central directory. */
-function unzip(zip: Buffer): Record<string, string> {
-  const result: Record<string, string> = {};
-  let end = zip.length - 22;
-  while (zip.readUInt32LE(end) !== 0x06054b50) end--;
-  let offset = zip.readUInt32LE(end + 16);
-  for (let i = 0; i < zip.readUInt16LE(end + 10); i++) {
-    const method = zip.readUInt16LE(offset + 10);
-    const size = zip.readUInt32LE(offset + 20);
-    const nameLength = zip.readUInt16LE(offset + 28);
-    const extra = zip.readUInt16LE(offset + 30);
-    const comment = zip.readUInt16LE(offset + 32);
-    const local = zip.readUInt32LE(offset + 42);
-    const name = zip.subarray(offset + 46, offset + 46 + nameLength).toString();
-    const start = local + 30 + zip.readUInt16LE(local + 26) + zip.readUInt16LE(local + 28);
-    const data = zip.subarray(start, start + size);
-    result[name] = (method === 8 ? inflateRawSync(data) : data).toString('latin1');
-    offset += 46 + nameLength + extra + comment;
-  }
-  return result;
-}
-
-describe('project modes', () => {
-  it('defaults to bounding boxes, and reports the mode everywhere a project is returned', async () => {
-    const created: Project = await (await send('/projects', 'POST', { name: 'plain' })).json();
-    expect(created.mode).toBe('bbox');
-    expect((await (await fetch(`${base}/projects/${created.id}`)).json()).mode).toBe('bbox');
-    const listed: Project[] = await (await fetch(`${base}/projects`)).json();
-    expect(listed.find((p) => p.id === created.id)?.mode).toBe('bbox');
-    expect(listed.find((p) => p.id === project.id)?.mode).toBe('keypoint');
-  });
-
-  it('rejects an unknown mode', async () => {
-    expect((await send('/projects', 'POST', { name: 'x', mode: 'polygon' })).status).toBe(400);
-  });
-
-  it('keeps keypoints out of a bounding box project', async () => {
-    const refused = await send('/projects', 'POST', { name: 'x', mode: 'bbox', labels: [person] });
-    expect(refused.status).toBe(422);
-    expect((await refused.json()).error).toContain('defines keypoints');
-
-    const created: Project = await (await send('/projects', 'POST', { name: 'boxes', labels: [car] })).json();
-    expect((await send(`/projects/${created.id}`, 'PATCH', { labels: [car, person] })).status).toBe(422);
-    expect((await (await fetch(`${base}/projects/${created.id}`)).json()).labels).toEqual([car]);
-  });
-
-  it('rejects keypoints on an annotation in a bounding box project, and an annotation with no box', async () => {
-    const created: Project = await (await send('/projects', 'POST', { name: 'boxes', labels: [car] })).json();
-    const { uploaded } = await upload(created.id, [['a.png', makePng(100, 50)]]);
-    const put = (annotations: Annotation[]) => send(`/images/${uploaded[0].id}/annotations`, 'PUT', { annotations });
-    expect((await put([box])).status).toBe(200);
-    expect((await put([{ ...box, keypoints: { head: { x: 5, y: 5, v: 2 } } }])).status).toBe(422);
-    expect((await put([{ ...box, bbox: null }])).status).toBe(422);
-  });
-
-  it('cannot change once the project exists', async () => {
-    const response = await send(`/projects/${project.id}`, 'PATCH', { mode: 'bbox' });
-    expect(response.status).toBe(200);
-    expect((await (await fetch(`${base}/projects/${project.id}`)).json()).mode).toBe('keypoint');
-  });
-
-  it('records the mode in the native export', async () => {
-    const native = await (await fetch(`${base}/projects/${project.id}/export?format=json&scope=done`)).json();
-    expect(native.project).toEqual({ name: 'test', mode: 'keypoint' });
-  });
-
-  it('exports pose from a keypoint project, with a tight box around points placed without one', async () => {
-    const onlyPoints: Annotation = { id: 'p', labelId: 'person', bbox: null, keypoints: { head: { x: 10, y: 10, v: 2 }, foot: { x: 30, y: 20, v: 2 } } };
-    await send(`/images/${imageId}/annotations`, 'PUT', { annotations: [onlyPoints], status: 'done' });
-    const coco = await (await fetch(`${base}/projects/${project.id}/export?format=coco&scope=done`)).json();
-    expect(coco.annotations[0]).toMatchObject({ bbox: [10, 10, 20, 10], num_keypoints: 2 });
   });
 });

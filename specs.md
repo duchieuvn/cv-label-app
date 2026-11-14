@@ -16,13 +16,17 @@ multi-user workflows) for fast keyboard-driven annotation and first-class COCO/Y
 - Export to native JSON, COCO, and YOLO (detection and pose), and a separate image label export
 - Importing a folder by detecting every image in it and its subfolders (section 7)
 - Selecting all images under a folder and adding a label to them as a group (section 8)
-- Training a detector on a project's boxes and drawing boxes on its remaining images (section 10)
+- Training a detector or pose model on a project's annotations and drawing on its remaining images, locally or on a
+  remote GPU machine (section 10)
 - Importing annotations from a COCO file or a LabelApp export into a project's existing images (section 12)
+- Sharing a project as a file that a teammate opens on another computer, with the images in their own folders
+  (section 13). It is a copy, not shared editing
 
 **Out of scope (v1)**
 
 - Multiple users, authentication, roles, review workflows. The app is a single-user local
   tool and binds to `127.0.0.1` by default. Concurrent edits of one image are last-write-wins.
+  A shared project (section 13) is an independent copy: nothing syncs or merges back.
 - Other annotation types (polygons, masks, video, text)
 - Importing YOLO label files, and importing images along with annotations. Import only annotates images already in the project
 - Generated thumbnails (the browser lazy-loads originals)
@@ -127,21 +131,28 @@ rejected with `403`.
 | `PUT /api/images/:id/annotations` | Replace with `{ annotations?, status? }` |
 | `DELETE /api/images/:id` | Delete one image |
 | `GET /api/images/:id/file` | The image bytes |
-| `GET /api/projects/:id/export?format=&scope=&includeImages=` | Download an export |
+| `GET /api/projects/:id/export?format=&scope=&includeImages=` | Download an export. `format=project` downloads a project file (section 13) and ignores the other parameters |
+| `POST /api/projects/open` | Multipart field `file` (a project file) plus `options` (JSON `{ name?, paths }`) and a `dryRun` flag; see section 13. A dry run returns a preview; otherwise `201` with `{ project, warnings }` |
 | `POST /api/projects/:id/import` | Multipart field `file` plus `createLabels`, `overwrite`, `markDone`, `dryRun` flags; see section 12. Returns `{ summary, dryRun, project }` |
 | `GET /api/projects/:id/sources` | List source folders |
 | `POST /api/projects/:id/sources` | Register `{ path }` and start a scan. Returns `202` with the source and its scan |
 | `POST /api/sources/:id/scan` | Start a rescan. `{ includeExcluded? }`. Returns `202`, or `409` if one is running |
 | `GET /api/sources/:id/scan` | Scan progress and result |
 | `DELETE /api/sources/:id/scan` | Cancel the running scan |
+| `PATCH /api/sources/:id` | Point the source at another folder, `{ path }`, and rescan it. Returns `202`, or `409` if the folder overlaps another source or a scan is running |
 | `DELETE /api/sources/:id` | Remove the source and its images from the project. Files on disk are untouched |
 | `GET /api/projects/:id/folders` | Folder tree with image counts |
 | `POST /api/projects/:id/images/bulk` | Change a group of images; see section 8 |
 | `GET /api/projects/:id/autobox` | Auto box job status, image counts, the project's checkpoints and other projects' (`otherCheckpoints`); see section 10 |
-| `POST /api/projects/:id/autobox` | Start a job from `{ mode?, confidence?, checkpoint?, patience? }`, where `mode` is `train` or `predict`. Returns `202`, `409` if one is running, or `422` if the project is not ready or not a `bbox` project |
+| `POST /api/projects/:id/autobox` | Start a job from `{ mode?, confidence?, checkpoint?, patience? }`, where `mode` is `train` or `predict`. Returns `202`, `409` if one is running, or `422` if the project is not ready |
 | `DELETE /api/projects/:id/autobox` | Cancel the running job |
 | `DELETE /api/projects/:id/autobox/checkpoints/:checkpoint` | Delete one saved checkpoint. Drawn boxes are kept. Returns `404` if it does not exist, or `409` during a job |
 | `DELETE /api/projects/:id/autobox/predictions` | Remove all unreviewed predictions. Returns `{ cleared }` |
+| `GET /api/projects/:id/remote` | Status of the one-click remote run, or `null` |
+| `POST /api/projects/:id/remote` | Start a one-click remote training from `{ target, password?, model?, epochs?, patience?, imgsz?, confidence?, checkpoint?, keepOriginals? }`; see section 10. Returns `202`, `409` if one is going, or `422` if the project is not ready |
+| `DELETE /api/projects/:id/remote` | Cancel the local side of the remote run |
+| `GET /api/projects/:id/remote/bundle?model=&epochs=&patience=&imgsz=&confidence=&checkpoint=` | Download a remote training bundle; see section 10. Returns `422` if the project is not ready |
+| `POST /api/projects/:id/remote/results` | Multipart `results` (JSON) and optional `weights` (`.pt`) from a remote run. Returns the counts, or `422` if the results are not from this project's bundle |
 
 **Uploads** accept JPEG, PNG, WebP, GIF and BMP up to 100 MB each. The type comes from the file's
 contents, never its name or declared MIME type, so SVG and other active content cannot be stored
@@ -159,6 +170,8 @@ Image labels never affect which images `coco` and `yolo` select. Otherwise a `to
 with an image label and no boxes would be exported with an empty YOLO label file, wrongly claiming it
 contains no objects. Image labels have their own export, `image_labels`, described below.
 
+- **`project`**: a project file for a teammate's computer (section 13). It is not a training format, so it holds
+  every image, untouched `todo` images included, and the rule above does not apply to it.
 - **`json`**: native format, lossless: project with its mode, labels, images, annotations, and each
   image's `folder` and `imageLabels`.
 - **`coco`**: one JSON file. `categories[].keypoints` and `skeleton` (1-indexed) are included for
@@ -309,6 +322,11 @@ and the rescan result, and they open in the annotator with a banner and read-onl
 `changed` image returns to normal if its file regains the stored dimensions; otherwise the user deletes
 it from the project and re-adds it through a rescan with `includeExcluded`, which starts it fresh.
 
+A source can be pointed at another path (`PATCH /api/sources/:id`) when its folder moves, or when a project opened from
+a project file was given the wrong one. The path passes the same checks as adding a folder. Every image of the source
+then has its stored size and time forgotten, and the rescan that follows checks each file's dimensions, so images found
+at the new path recover and the rest become `missing`. Annotations are never touched.
+
 ### Order and naming
 
 Scanned images sort by relative path in natural order, so `img2.jpg` comes before `img10.jpg`. An image's
@@ -428,6 +446,8 @@ to scan, because more of each file is read.
 | Open the project page | 1.5 s |
 | Open the annotator on the whole project | 2.9 s |
 | Draw a box, from input to render | 0.08 s |
+| Export a project file, half the images with 2 boxes each | 1.5 s, and 1 MB for this repetitive data. Real annotations compress less |
+| Open that file, before its scan | 2.4 s (0.7 s to read and check it, 1.7 s to create the project) |
 
 Known limits of the design:
 
@@ -438,6 +458,8 @@ Known limits of the design:
 - The client loads the full image list, so opening a page over 100,000 images costs a 30 MB response. The
   annotator's list renders only the rows on screen, and refreshes during a scan back off as the list grows.
 - SQLite blocks the server while a large query runs, so other requests wait during it.
+- The scan that follows opening a project file inspects every file, since no stored size or time can match, so it
+  takes as long as a first scan.
 
 ## 10. Adaptive auto bounding box
 
@@ -448,8 +470,8 @@ Every trained model is kept as a checkpoint, so any of them can draw again later
 
 ### What a run does
 
-1. **Trains** a YOLOv8 nano detector from the checkpoint chosen in **Train from**, until validation accuracy
-   stops improving for the chosen patience, with a limit of 300 epochs. The image size is 640. The model with
+1. **Trains** a YOLOv8 nano model (`yolov8n.pt`, or `yolov8n-pose.pt` in a keypoint project) from the checkpoint
+   chosen in **Train from**, until validation accuracy stops improving for the chosen patience, with a limit of 300 epochs. The image size is 640. The model with
    the best validation score is used, and saved as a new checkpoint.
 2. **Predicts** on the target images one at a time, and saves each image's boxes as soon as they exist,
    so they appear in the grid during the run.
@@ -473,8 +495,12 @@ Detections scoring below it are not drawn. It does not affect training, so tryin
 | `done` with no annotations | Neither. It is a true negative chosen by the user, so it is not drawn on |
 | Unavailable (section 7) | Neither |
 
-Training needs at least 10 training images, and any run needs one target. Predicted annotations have a box
-and no keypoints, and use the label of the class the model predicted.
+Training needs at least 10 training images, and any run needs one target. In a `bbox` project a predicted
+annotation has a box and no keypoints. In a `keypoint` project it has keypoints and no box, as section 11 requires:
+each predicted keypoint scoring at least 0.5 is placed as visible, the others stay unplaced, and an instance left
+with none is not drawn. Pose training lines pad every label to the largest keypoint count, as the YOLO export does,
+and a checkpoint records the keypoint ids behind its slots, so a keypoint deleted since is simply never placed.
+Either way the annotation uses the label of the class the model predicted.
 
 ### Checkpoints
 
@@ -485,7 +511,7 @@ selected in **Draw with**, and boxes already drawn are kept. Deleting the projec
 
 | | **Train from** | **Draw with** |
 | --- | --- | --- |
-| `yolov8n.pt`, pretrained on COCO | Yes, always offered | No: it knows COCO's classes, not the project's labels |
+| Base weights pretrained on COCO: `yolov8n.pt`, or `yolov8n-pose.pt` in a keypoint project | Yes, always offered | No: it knows COCO's classes, not the project's labels |
 | Checkpoint with the project's current set of labels | Yes | Yes |
 | Checkpoint from before labels were added or removed | No: shown disabled | Yes |
 | Another `bbox` project's checkpoint, listed under **From other projects** | Only if its classes are exactly this project's labels, by name | Yes. Labels it predicts that this project lacks are added first |
@@ -495,14 +521,15 @@ safe; in another project the names decide, ignoring case, so a model trained on 
 `bottle` in another. That lets a new project start from a model trained elsewhere before it has drawn a single box.
 Its handle in another project is `<projectId>/<checkpoint>`, it is listed in every `bbox` project, and it can
 only be deleted from the project that trained it. A request that leaves out `checkpoint` never gets another
-project's: drawing without a trained model of its own is refused, and training starts from `yolov8n.pt`.
+project's: drawing without a trained model of its own is refused, and training starts from the base weights.
 
-**Train from** starts on the newest checkpoint that can continue, or `yolov8n.pt` if there is none, and
+**Train from** starts on the newest checkpoint that can continue, or the base weights (`yolov8n.pt`, or
+`yolov8n-pose.pt` in a keypoint project) if there is none, and
 **Draw with** starts on the newest checkpoint. Each follows new checkpoints until the user picks another, and
 that pick lasts until the page is reloaded or the checkpoint stops being valid. An API request leaving out
 `checkpoint` gets the same defaults, and a request naming an unusable one gets `422`.
 
-**Patience** is the number of epochs without improvement that ends training. From `yolov8n.pt` it is always 20
+**Patience** is the number of epochs without improvement that ends training. From the base weights it is always 20
 and cannot be changed, and the server rejects a request that sets it. From a checkpoint the user chooses it,
 from 1 to the 300 epoch limit, starting at 20. Training always runs at least one more epoch than the patience,
 even when the checkpoint is already at its best.
@@ -515,6 +542,57 @@ A checkpoint knows only what it was trained on. Class numbers are stored as labe
 reordering labels is safe, but **Draw with trained model** never predicts a label added since training, and
 drops predictions for a label deleted since then. Boxes reviewed since training improve the model only after
 training again.
+
+### Remote training
+
+A larger model needs a GPU, which this machine may not have. The remote machine's only jobs are training and
+prediction; nothing about the app's format lives there, and every conversion happens locally.
+
+**One click.** The panel's **Train on server and draw** does the whole round trip (`POST /api/projects/:id/remote`,
+`GET` for status, `DELETE` to cancel): the app makes the bundle, runs `scripts/remote_train.py` itself as a child
+process with `--json`, adds the trained model as a checkpoint when it comes back, and then starts the ordinary local
+**Draw with trained model** job with it, showing the phase, upload progress, the server's GPU and epochs as it goes.
+The server only ever trains. It gets only the labelled images (the training images of the table above), never the
+rest of the dataset, so drawing has to happen here, and it does: the same local job, with the same rules, that a
+local training ends with. If a local job is running at that moment, or nothing is left to draw on, the status says
+so and the checkpoint waits in **Draw with**. The script's own output is
+printed on the server's console too, prefixed with the bundle id, as are state changes of local jobs and every API
+request that changes something or fails. The request carries the
+server as `user@host` and a password, which the app hands to the script on stdin for one login; it is never stored,
+logged, or returned in any status. An empty password means the SSH agent or key files. One remote run goes at a time
+per project, and not alongside a local job. Cancelling stops the local side only: training already started keeps
+running on the server, and `scripts/remote_train.py fetch <bundle-id> user@host` can still collect it, which is why
+the status shows the bundle id. The steps below are the same thing done by hand, and stay available for a run that
+needs it.
+
+1. **Download bundle** (`GET /api/projects/:id/remote/bundle?model=&epochs=&patience=&imgsz=&confidence=&checkpoint=`)
+   is a compressed zip holding only what training needs: `job.json`, `worker.py` (a copy of the worker), the
+   training images with their labels, and `start.pt` when continuing from a checkpoint. No other image, and nothing
+   from the database, is in it. `model` is the YOLOv8 size letter, `n` to `x`, default `m`, so a run starts from
+   `yolov8m.pt`, or `yolov8m-pose.pt` in a keypoint project; a checkpoint fixes the size instead. A bundle needs the same 10 training images as a local run. The app records the bundle: its id, task,
+   class label ids and names, and the keypoint ids per class.
+2. `scripts/remote_train.py train <bundle.zip> user@host` runs locally in the `ml` conda env and needs `paramiko`. It
+   asks for the password once, keeps one SSH connection, and does everything through it. Before upload it resizes every
+   image to the training size on its long side (photos are already compressed, so only this makes the transfer small;
+   `--keep-originals` skips it), and targets keep their original size in `job.json` so predictions come back in the
+   original pixels (a bundle made by the app has no targets, so this only matters for a hand-made one). On the server it
+   uses `~/labelapp-remote/` only. It finds conda, or installs Miniconda there, and
+   creates the conda env `labelapp-remote` from conda-forge (Anaconda's default channels would first demand that their
+Terms of Service be accepted) with PyTorch and ultralytics **once**, on the first run; later runs reuse it
+   (`--reinstall` rebuilds it). It starts `worker.py --standalone` under `nohup`, so a dropped connection does not
+   stop training, follows `progress.jsonl`, then downloads `results.json` (the training figures) and `best.pt` as one zip into
+   `remote-results/<bundle>/`. `fetch <bundle-id> user@host` collects a run that outlived the terminal, and
+   `status` shows how far it is.
+3. **Import results** (`POST /api/projects/:id/remote/results`, multipart `results` and optional `weights`) is
+   accepted only if the bundle id names a bundle this app made for this project, and for the same task. With `weights`,
+   the file becomes a checkpoint of the project, marked *remote* with its model size, which **Draw with** and **Train
+   from** offer like any other; the response names it. The format also allows predictions, which the app's own bundles
+   never ask for: they are mapped through the bundle's record, so a label or keypoint deleted since loses them, and
+   written exactly as a local run writes them, as unreviewed and never over an image a person edited or finished.
+
+A `.pt` file is a PyTorch pickle, and loading it runs code. It is accepted only here, together with the results of
+the app's own bundle, which is the user's statement that they trained it on a server they trust. Nothing else ever
+imports a model file.
 
 ### Reviewing predictions
 
@@ -555,8 +633,8 @@ converted to an upright JPEG of at most 640px under `data/tmp/autobox/<job>/`, w
 job ends, and left-overs from a restart are deleted at the next start. This also handles GIF and scanned files
 with any name, which YOLO would not read directly. Each checkpoint is in `data/models/projects/<projectId>/`, as `<id>.pt`
 and `<id>.json`. A model saved before checkpoints existed becomes the checkpoint `best` at the next start. A
-checkpoint is reached by id from this list, never by a path from a request, and files are never accepted as
-checkpoints, because loading one can run code. The first run downloads `yolov8n.pt` (about 6 MB) to
+checkpoint is reached by id from this list, never by a path from a request. The only model file ever accepted is
+the one a remote run returns with its results, as described under "Remote training". The first run downloads `yolov8n.pt` (about 6 MB) to
 `data/models/`, so it needs internet access. Ultralytics keeps its settings in `data/models/config/`, and
 usage reporting and automatic package installs are turned off.
 
@@ -572,14 +650,15 @@ does not copy any files.
 | Canvas and details | Boxes, their coordinates, and changing an instance's label | Keypoints, skeletons, and the keypoint list |
 | Shortcuts in the help dialog | Box shortcuts | Keypoint shortcuts, including `N`, `O` and Shift+click |
 | Label settings | Name and color | Name, color, keypoints, skeleton, and **Add COCO person** |
-| Auto bounding box (section 10) | Panel, **Auto** tab and *auto* badge | Not offered. There is no keypoint model yet |
+| Auto labeling (section 10) | **Auto bounding box** panel with a detector, **Auto** tab and *auto* badge | **Auto keypoints** panel with a pose model, **Auto** tab and *auto* badge |
 | COCO export | Detection | Keypoints |
 | YOLO export | Detection | Pose |
 
 Both modes share images, folders, status, image labels and their export, group actions, and the native export.
 
 Labels, status and annotations belong to the project, so a mode needs no separate storage. Instead, invariant
-6 keeps keypoints out of `bbox` projects, and the server rejects auto boxing elsewhere. Everything else about a
+6 keeps keypoints out of `bbox` projects, and auto labeling trains the task the mode needs. A checkpoint belongs
+to a task, so a detector is never offered in a keypoint project, nor a pose model in a bounding box project. Everything else about a
 mode is what the client shows, described in one place: `MODES` in `client/src/modes.ts`. A later mode, such as
 segmentation, adds an entry there, a value in `projectModeSchema`, and the rules for its own annotations.
 
@@ -590,7 +669,7 @@ becomes `keypoint`, and otherwise `bbox`. No annotation is changed. So a `bbox` 
 6, while a `keypoint` project can hold boxes drawn before modes existed. Those boxes are kept and exported as
 before, follow their instance when it moves, and are not shown. A box-only instance appears in the instance list,
 where it can be deleted or given keypoints. Unreviewed predictions in such a project keep the **Auto** tab until
-they are reviewed. Its saved checkpoints stay on disk, unused, until the project is deleted.
+they are reviewed. Its detector checkpoints stay on disk, hidden, until the project is deleted.
 
 The API does not reject a box sent to a `keypoint` project, because it cannot tell that from one of these. The
 annotator has no way to draw one.
@@ -648,3 +727,63 @@ left untouched. All writes happen in one transaction, labels first.
 whenever an option changes, so the person reads what will happen before pressing **Import**. The summary reports
 images in the file, matched, written, annotations written, labels created or extended, and every skipped count by
 reason, with up to 50 per-entry details.
+
+## 13. Sharing a project
+
+A teammate on another computer can continue a project from a **project file** (`<name>.labelapp`). The file holds the
+project, not the photos: each person keeps their own copy of the images, wherever they like, and says where it is when
+opening the file. Nothing syncs afterwards. The opened project is an independent copy.
+
+### The file
+
+`GET /api/projects/:id/export?format=project` writes gzipped JSON:
+
+```jsonc
+{
+  "kind": "labelapp-project", "version": 1, "exportedAt": "…",
+  "project": { "name", "mode", "labels" },                  // label and keypoint ids kept
+  "sources": [{ "key": "s1", "name": "photos", "originalPath": "/home/a/photos", "exclusions": ["bad/x.jpg"] }],
+  "images": [{ "source": "s1", "relPath": "cats/1.jpg", "filename", "width", "height", "status",
+               "annotations", "imageLabels", "autoBoxed" }]
+}
+```
+
+- **Every image is included**, in display order, with its annotations, image labels and status. `autoBoxed` is the
+  stored flag, so unreviewed predictions stay unreviewed (section 10).
+- **Each source folder** is listed with the paths deleted from the project (section 7), so a rescan on the other
+  computer does not bring those images back. `originalPath` is only shown as a hint.
+- **Uploaded images** exist only in the exporting computer's `data/`, so they are listed under the source key
+  `uploads`, with their original filename as `relPath`.
+- **Not included:** image files, file states, sizes and times, auto box checkpoints, jobs and remote bundles.
+
+### Opening
+
+`POST /api/projects/open` reads the file, gzipped or plain, up to 256 MB. It refuses with `400` a file that is not a
+project file, has another version, or breaks any invariant of section 3, and checks that every image's folder exists
+in the file and that no path appears twice in one folder. Paths cannot contain `\`, or empty, `.` or `..` segments,
+so they never leave their folder.
+
+`options.paths` gives a path on this computer for each folder key, `uploads` included. Each path passes the same
+checks as adding a folder (section 7, `IMPORT_ROOTS` included), and two chosen folders must not overlap. A folder with
+no path is left out with its images, and the response lists a warning for it. Uploaded images placed in a folder become
+a source of that folder's name. Only one file of a name can be in it, so a later upload with the same name is left out
+with a warning.
+
+With `dryRun`, nothing is created. The response gives the project's name, mode, label and image counts, and per folder
+its image count, a few sample paths, the resolved path or why it cannot be used, and how many of up to 20 of its files,
+spread over the folder, exist under that path. The project list shows **Open a shared project**, which previews the
+file as soon as it is chosen and again after each path is typed. **Create project** stays disabled until every typed
+path is usable.
+
+Otherwise the project is created in one transaction, keeping the file's mode, labels and the source names, which form
+the top of the folder tree as on the exporting computer. Images get new ids and start `missing`, with no stored
+size or time. A scan of every chosen folder then starts, and it matches files by path:
+
+- A file found with the stored dimensions becomes `ok` (counted as recovered).
+- A file found with other dimensions becomes `changed`.
+- A file not found stays `missing`.
+- A file in the folder that the project does not have is added as `todo`, unless the file lists it as deleted.
+
+So annotations only become editable on images whose file is there and fits them. If a folder was placed wrongly, the
+project page's **Change path** points it at the right one (section 7).
+

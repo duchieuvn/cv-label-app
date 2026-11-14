@@ -15,8 +15,10 @@ import {
   type Label,
   type Project,
   type ProjectMode,
+  type RemoteBundle,
   type Source,
 } from '../shared/schema.ts';
+import type { BundleImageInput, OpenPlan } from './bundle.ts';
 
 export const MIGRATIONS = [
   `CREATE TABLE projects (
@@ -63,6 +65,12 @@ export const MIGRATIONS = [
   `ALTER TABLE projects ADD COLUMN mode TEXT NOT NULL DEFAULT 'bbox';
    UPDATE projects SET mode = 'keypoint'
      WHERE EXISTS (SELECT 1 FROM json_each(labels) WHERE json_array_length(value, '$.keypoints') > 0);`,
+  `CREATE TABLE remote_bundles (
+     id TEXT PRIMARY KEY,
+     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+     created_at TEXT NOT NULL,
+     bundle TEXT NOT NULL
+   );`,
 ];
 
 const IMAGE_META_COLUMNS = `id, project_id, filename, width, height, status, folder, image_labels,
@@ -71,8 +79,8 @@ const IMAGE_META_COLUMNS = `id, project_id, filename, width, height, status, fol
 // Marking an image done accepts its predictions, and marking it todo again takes that back, so an
 // undone group action leaves them out of training. Only saving annotations clears auto_boxed for good.
 const UNREVIEWED = `(auto_boxed = 1 AND status = 'todo')`;
-const AUTOBOX_TRAINABLE = `(file_state = 'ok' AND NOT ${UNREVIEWED} AND annotations != '[]'
-  AND EXISTS (SELECT 1 FROM json_each(annotations) WHERE json_extract(value, '$.bbox') IS NOT NULL))`;
+// Every stored annotation has a box or keypoints (invariant 3), either of which a model can learn from.
+const AUTOBOX_TRAINABLE = `(file_state = 'ok' AND NOT ${UNREVIEWED} AND annotations != '[]')`;
 const AUTOBOX_TARGET = `(file_state = 'ok' AND status = 'todo' AND (annotations = '[]' OR auto_boxed = 1))`;
 
 export type ImageFilter = { status?: ImageStatus; folder?: string; recursive?: boolean; label?: string };
@@ -374,6 +382,94 @@ export function createStore(dataDir: string) {
       db.prepare('DELETE FROM sources WHERE id = ?').run(id);
     },
 
+    /**
+     * Points a source at another folder. Every file's stamp is forgotten, so the next scan checks each file's
+     * dimensions rather than trusting a size and time that happen to match.
+     */
+    moveSource(id: string, path: string) {
+      transaction(() => {
+        db.prepare('UPDATE sources SET path = ? WHERE id = ?').run(path, id);
+        db.prepare('UPDATE images SET file_size = NULL, file_mtime = NULL WHERE source_id = ?').run(id);
+      });
+    },
+
+    /** Every image of a project for a project bundle, in display order, with the stored auto box flag. */
+    listImagesForBundle(projectId: string): BundleImageInput[] {
+      const rows = db
+        .prepare(
+          `SELECT source_id, rel_path, folder, filename, width, height, status, annotations, image_labels, auto_boxed, seq
+           FROM images WHERE project_id = ?`,
+        )
+        .all(projectId) as Row[];
+      return sortRows(rows).map((r) => ({
+        sourceId: r.source_id,
+        relPath: r.rel_path,
+        filename: r.filename,
+        width: r.width,
+        height: r.height,
+        status: r.status,
+        annotations: JSON.parse(r.annotations),
+        imageLabels: JSON.parse(r.image_labels),
+        autoBoxed: r.auto_boxed === 1,
+      }));
+    },
+
+    /** Excluded paths of all of a project's sources, by source id. */
+    listProjectExclusions(projectId: string): Map<string, string[]> {
+      const rows = db
+        .prepare(
+          `SELECT e.source_id, e.rel_path FROM source_exclusions e JOIN sources s ON s.id = e.source_id
+           WHERE s.project_id = ? ORDER BY e.rel_path`,
+        )
+        .all(projectId) as Row[];
+      const result = new Map<string, string[]>();
+      for (const r of rows) result.set(r.source_id, [...(result.get(r.source_id) ?? []), r.rel_path]);
+      return result;
+    },
+
+    /**
+     * Creates a project from an opened bundle in one transaction. Images start `missing`, with no stamp, until a scan
+     * of their folder finds each file and checks its dimensions. Returns the project and its new sources.
+     */
+    createProjectFromBundle(plan: OpenPlan): { project: Project; sources: Omit<Source, 'scan'>[] } {
+      return transaction(() => {
+        const project = store.createProject(plan.name, plan.labels, plan.mode);
+        const created = new Map<string, Omit<Source, 'scan'>>();
+        const exclude = db.prepare('INSERT OR IGNORE INTO source_exclusions (source_id, rel_path) VALUES (?, ?)');
+        for (const source of plan.sources) {
+          const row = store.createSource(project.id, source.baseName, source.path);
+          created.set(source.key, row);
+          for (const relPath of source.exclusions) exclude.run(row.id, relPath);
+        }
+        const insert = db.prepare(
+          `INSERT INTO images (id, project_id, filename, stored_name, width, height, status, annotations, seq, source_id,
+             rel_path, folder, image_labels, file_state, auto_boxed)
+           VALUES (?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, 'missing', ?)`,
+        );
+        plan.images.forEach((image, index) => {
+          const source = created.get(image.sourceKey)!;
+          const slash = image.relPath.lastIndexOf('/');
+          const folder = slash < 0 ? source.name : `${source.name}/${image.relPath.slice(0, slash)}`;
+          insert.run(
+            randomUUID(),
+            project.id,
+            image.filename,
+            image.width,
+            image.height,
+            image.status,
+            JSON.stringify(image.annotations),
+            index + 1,
+            source.id,
+            image.relPath,
+            folder,
+            JSON.stringify(image.imageLabels),
+            image.autoBoxed ? 1 : 0,
+          );
+        });
+        return { project: store.getProject(project.id)!, sources: [...created.values()].map((s) => store.getSource(s.id)!) };
+      });
+    },
+
     knownFiles(sourceId: string): Map<string, KnownFile> {
       const rows = db
         .prepare('SELECT id, rel_path, width, height, file_size, file_mtime, file_state FROM images WHERE source_id = ?')
@@ -548,6 +644,32 @@ export function createStore(dataDir: string) {
 
     deleteImage(id: string) {
       db.prepare('DELETE FROM images WHERE id = ?').run(id);
+    },
+
+    /** Remembers a bundle the app issued, so only results of its own bundles can come back. */
+    createBundle(bundle: RemoteBundle) {
+      db.prepare('INSERT INTO remote_bundles (id, project_id, created_at, bundle) VALUES (?, ?, ?, ?)').run(
+        bundle.id,
+        bundle.projectId,
+        bundle.createdAt,
+        JSON.stringify(bundle),
+      );
+    },
+
+    getBundle(id: string): RemoteBundle | null {
+      const row = db.prepare('SELECT bundle FROM remote_bundles WHERE id = ?').get(id) as Row | undefined;
+      return row ? JSON.parse(row.bundle) : null;
+    },
+
+    /** Sizes of a project's images by id, for checking predictions against. */
+    imageSizes(projectId: string, ids: string[]): Map<string, { width: number; height: number }> {
+      const select = db.prepare('SELECT width, height FROM images WHERE project_id = ? AND id = ?');
+      const sizes = new Map<string, { width: number; height: number }>();
+      for (const id of new Set(ids)) {
+        const row = select.get(projectId, id) as Row | undefined;
+        if (row) sizes.set(id, { width: row.width, height: row.height });
+      }
+      return sizes;
     },
   };
   return store;

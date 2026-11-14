@@ -69,6 +69,55 @@ export const saveAnnotationsSchema = z.object({
 });
 export const createSourceSchema = z.object({ path: z.string().min(1).max(4096) });
 export const startScanSchema = z.object({ includeExcluded: z.boolean().default(false) });
+/** What a remote training bundle asks the server to do. See specs.md section 10, "Remote training". */
+export const remoteBundleSchema = z.object({
+  /** YOLOv8 size letter. Ignored when continuing from a checkpoint, which fixes the architecture. */
+  model: z.enum(['n', 's', 'm', 'l', 'x']).default('m'),
+  epochs: z.coerce.number().int().min(1).max(1000).default(300),
+  patience: z.coerce.number().int().min(1).max(1000).default(50),
+  imgsz: z.coerce.number().int().min(320).max(1280).multipleOf(32).default(640),
+  batch: z.coerce.number().int().min(1).max(256).default(16),
+  confidence: z.coerce.number().min(0.01).max(0.99).default(0.65),
+  /** A checkpoint id from the project's list to continue from. Only ever matched against that list. */
+  checkpoint: z.string().min(1).max(200).optional(),
+});
+
+/** Starts a one-click remote run. The password is used for one SSH login and is never stored or returned. */
+export const startRemoteSchema = remoteBundleSchema.extend({
+  target: z.string().trim().min(3).max(300).regex(/^[^\s/]+@[^\s@/]+$/, 'Enter the server as user@host'),
+  password: z.string().max(1000).default(''),
+  /** Upload the images as they are instead of resized to the training size. */
+  keepOriginals: z.boolean().default(false),
+});
+
+const keypointResult = z.tuple([z.number().finite(), z.number().finite(), z.number().finite()]);
+/** What the worker writes as results.json in standalone mode. Coordinates are image pixels of the original image. */
+export const remoteResultsSchema = z.object({
+  bundleId: z.string().min(1).max(100),
+  task: z.enum(['detect', 'pose']),
+  trainedAt: z.string().min(1),
+  trainImages: z.number().int().min(0),
+  epochs: z.number().int().min(0),
+  bestMap50: z.number().finite().nullable(),
+  stoppedEarly: z.boolean().default(false),
+  predictions: z.array(
+    z.object({
+      id: z.string().min(1).max(100),
+      boxes: z.array(
+        z.object({
+          cls: z.number().int().min(0),
+          x: z.number().finite(),
+          y: z.number().finite(),
+          w: z.number().finite(),
+          h: z.number().finite(),
+          keypoints: z.array(keypointResult).optional(),
+        }),
+      ),
+    }),
+  ),
+  skipped: z.array(z.object({ path: z.string(), reason: z.string() })).default([]),
+});
+
 export const startAutoBoxSchema = z.object({
   mode: z.enum(['train', 'predict']).default('train'),
   confidence: z.number().min(0.01).max(0.99).optional(),
@@ -101,6 +150,55 @@ export const bulkUpdateSchema = z
       ctx.addIssue({ code: 'custom', message: 'A label cannot be both added and removed' });
     }
   });
+
+/**
+ * A path inside a folder, with `/` separators. It can never leave the folder it is joined to: no empty, `.` or `..`
+ * segments, no leading `/`, and no `\`, which some systems treat as a separator.
+ */
+export const isSafeRelPath = (path: string) =>
+  !path.includes('\\') && !path.includes('\0') && path.split('/').every((s) => s !== '' && s !== '.' && s !== '..');
+const relPath = z.string().min(1).max(4096).refine(isSafeRelPath, 'Invalid relative path');
+
+/** The pseudo-source key of uploaded images in a project bundle. Their `relPath` is the original filename. */
+export const BUNDLE_UPLOADS = 'uploads';
+export const BUNDLE_KIND = 'labelapp-project';
+export const BUNDLE_VERSION = 1;
+
+/** A project copied to another computer, without image files. See specs.md section 13. */
+export const projectBundleSchema = z.object({
+  kind: z.literal(BUNDLE_KIND),
+  version: z.literal(BUNDLE_VERSION),
+  exportedAt: z.string().max(100),
+  project: z.object({ name, mode: projectModeSchema, labels: labelsSchema }),
+  sources: z.array(
+    z.object({
+      key: id,
+      name: name.refine((n) => !n.includes('/'), 'Folder names cannot contain "/"'),
+      originalPath: z.string().max(4096),
+      exclusions: z.array(relPath).default([]),
+    }),
+  ),
+  images: z.array(
+    z.object({
+      source: id,
+      relPath,
+      filename: z.string().min(1).max(255),
+      width: z.number().int().positive(),
+      height: z.number().int().positive(),
+      status: imageStatusSchema,
+      annotations: z.array(annotationSchema),
+      imageLabels: z.array(id).default([]),
+      /** The stored flag. It counts as an unreviewed prediction only while the image is `todo`. */
+      autoBoxed: z.boolean().default(false),
+    }),
+  ),
+});
+
+/** Where each bundle folder is on this computer, by source key. Null or missing leaves it out. */
+export const openBundleSchema = z.object({
+  name: name.optional(),
+  paths: z.record(z.string(), z.string().max(4096).nullable()).default({}),
+});
 
 export type ProjectMode = z.infer<typeof projectModeSchema>;
 export type Label = z.infer<typeof labelSchema>;
@@ -138,6 +236,97 @@ export type ImportSummary = {
 };
 
 export type ImportResult = { summary: ImportSummary; dryRun: boolean; project: Project };
+
+export type ProjectBundle = z.infer<typeof projectBundleSchema>;
+export type OpenBundleOptions = z.infer<typeof openBundleSchema>;
+
+/** What opening a bundle would do, returned by a dry run. */
+export type BundlePreview = {
+  name: string;
+  mode: ProjectMode;
+  labelCount: number;
+  imageCount: number;
+  folders: {
+    key: string;
+    name: string;
+    /** Where the folder was on the computer that exported it, as a hint. Empty for uploads. */
+    originalPath: string;
+    imageCount: number;
+    samples: string[];
+    /** The path this request gave, resolved, or null when none was given. */
+    path: string | null;
+    /** Why that path cannot be used, or null. */
+    error: string | null;
+    /** How many of up to 20 of the folder's files exist under that path. */
+    found: number;
+    checked: number;
+  }[];
+};
+
+export type OpenBundleResult = { project: Project; warnings: string[] };
+
+export type RemoteBundleOptions = z.infer<typeof remoteBundleSchema>;
+export type RemoteResults = z.infer<typeof remoteResultsSchema>;
+
+/** What the app remembers about a bundle it issued, which is what maps its results back to labels. */
+export type RemoteBundle = {
+  id: string;
+  projectId: string;
+  createdAt: string;
+  task: AutoBoxTask;
+  modelSize: string;
+  imgsz: number;
+  confidence: number;
+  classIds: string[];
+  classNames: string[];
+  keypointIds: string[][];
+  /** The checkpoint it continues from, if any. */
+  checkpoint: string | null;
+};
+
+export type RemoteJobPhase = 'bundling' | 'connecting' | 'preparing' | 'installing' | 'uploading' | 'training' | 'downloading' | 'importing' | 'drawing';
+
+/** A one-click remote run, from bundling to the local drawing with the new checkpoint. Status lives in memory, like the local job's. */
+export type RemoteJobStatus = {
+  state: 'running' | 'done' | 'cancelled' | 'failed';
+  phase: RemoteJobPhase;
+  bundleId: string | null;
+  target: string;
+  modelSize: string;
+  /** Bytes uploaded so far and the bundle's size. */
+  uploaded: number;
+  uploadTotal: number;
+  gpu: string | null;
+  trainImages: number;
+  epoch: number;
+  bestMap50: number | null;
+  summary: RemoteResultsSummary | null;
+  /** The checkpoint the run added, once imported. */
+  checkpointId: string | null;
+  /** What happened to the local drawing afterwards: started, or why not. */
+  drawing: string | null;
+  error: string | null;
+};
+
+/** What importing a bundle's results did. */
+export type RemoteResultsSummary = {
+  bundleId: string;
+  task: AutoBoxTask;
+  trainedAt: string;
+  trainImages: number;
+  epochs: number;
+  bestMap50: number | null;
+  /** Images the file holds predictions for. */
+  predicted: number;
+  /** Images that received at least one annotation. */
+  boxedImages: number;
+  annotations: number;
+  /** Predictions dropped: edited since the bundle was made, no longer in the project, or for a deleted label. */
+  dropped: number;
+  skipped: { path: string; reason: string }[];
+  checkpointAdded: boolean;
+  checkpointId: string | null;
+};
 
 export type Project = {
   id: string;
@@ -193,6 +382,9 @@ export type AutoBoxStatus = {
 };
 
 /** What is stored about a trained model. `classIds` holds the label id of each model class, fixed when it was trained. */
+/** What a model detects: boxes, or boxes with keypoints. A project's mode decides which it can use. */
+export type AutoBoxTask = 'detect' | 'pose';
+
 export type AutoBoxModel = {
   trainedAt: string;
   trainImages: number;
@@ -201,6 +393,14 @@ export type AutoBoxModel = {
   classIds: string[];
   /** The label names behind `classIds` when trained, which let another project use the model. Older files lack it. */
   classNames?: string[];
+  /** Older files lack it and are `detect`. */
+  task?: AutoBoxTask;
+  /** Per class, the keypoint ids behind the model's keypoint slots when trained. Pose models only. */
+  keypointIds?: string[][];
+  /** YOLOv8 size letter. Older files lack it and are `n`. */
+  modelSize?: string;
+  /** Where it was trained. Older files lack it and are `local`. */
+  source?: 'local' | 'remote';
 };
 
 export type AutoBoxCheckpoint = AutoBoxModel & {
